@@ -383,6 +383,7 @@ fn try_to_replace_encoded_text(
             _ => {}
         }
     }
+
     Ok(())
 }
 
@@ -560,8 +561,8 @@ mod tests {
 
         save_document(&file_path, &mut doc);
 
-        let stop = Arc::new(AtomicBool::new(false));
         let in_file = File::open(file_path).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
         let mut in_doc = Document::load_from(in_file, stop).unwrap();
 
         let out_buf = Vec::new();

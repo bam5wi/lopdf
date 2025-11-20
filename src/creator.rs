@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::{Dictionary, Document, Object, ObjectId};
+use crate::{Dictionary, Document, Object, ObjectId, Stream, FontData};
 
 impl Document {
     /// Create new PDF document with version.
@@ -120,6 +120,81 @@ impl Document {
         }
         Ok(())
     }
+
+    /// Add font to a page.
+    /// # Examples
+    ///
+    /// ```no_run
+    /// // Assuming you have a font file at "./SomeFont.ttf"
+    /// use lopdf::dictionary;
+    ///
+    /// let font_file = std::fs::read("./SomeFont.ttf").unwrap();
+    ///
+    /// // Create a new FontData instance with the font file.
+    /// let font_name = "SomeFont".to_string();
+    /// let mut font_data = lopdf::FontData::new(&font_file, font_name.clone());
+    ///
+    /// // Customize the font data if needed.
+    /// font_data
+    ///     .set_italic_angle(10)
+    ///     .set_encoding("WinAnsiEncoding".to_string());
+    ///
+    ///
+    /// // Create a new PDF document.
+    /// let mut doc = lopdf::Document::with_version("1.5");
+    ///
+    /// // Add the font to the document.
+    /// let font_id = doc.add_font(font_data).unwrap();
+    ///
+    /// // Now you can use `font_id` to reference the font in your PDF content.
+    /// // For example:
+    /// let resources_id = doc.add_object(dictionary! {
+    ///  "Font" => dictionary! {
+    ///         font_name => font_id,
+    ///     },
+    /// });
+    /// ```
+    pub fn add_font(&mut self, font_data: FontData) -> Result<ObjectId> {
+        // Create embedded font stream
+        let font_stream = Stream::new(
+            dictionary! {
+                "Length1" => Object::Integer(font_data.bytes().len() as i64),
+            },
+            font_data.bytes(),
+        );
+        let font_file_id = self.add_object(font_stream);
+        let font_name = font_data.font_name.clone();
+
+        // Create font descriptor dictionary
+        let font_descriptor_id = self.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => Object::Name(font_name.clone().into_bytes()),
+            "Flags" => Object::Integer(font_data.flags),
+            "FontBBox" => Object::Array(vec![
+                Object::Integer(font_data.font_bbox.0),
+                Object::Integer(font_data.font_bbox.1),
+                Object::Integer(font_data.font_bbox.2),
+                Object::Integer(font_data.font_bbox.3),
+            ]),
+            "ItalicAngle" => Object::Integer(font_data.italic_angle),
+            "Ascent" => Object::Integer(font_data.ascent),
+            "Descent" => Object::Integer(font_data.descent),
+            "CapHeight" => Object::Integer(font_data.cap_height),
+            "StemV" => Object::Integer(font_data.stem_v),
+            "FontFile2" => Object::Reference(font_file_id),
+        });
+
+        // Create font dictionary
+        let font_id = self.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => Object::Name(font_name.clone().into_bytes()),
+            "FontDescriptor" => Object::Reference(font_descriptor_id),
+            "Encoding" => Object::Name(font_data.encoding.into_bytes()),
+        });
+
+        Ok(font_id)
+    }
 }
 
 #[cfg(test)]
@@ -127,7 +202,7 @@ pub mod tests {
     use std::path::PathBuf;
 
     use crate::content::*;
-    use crate::{Document, Object, Stream};
+    use crate::{Document, FontData, Object, Stream};
 
     #[cfg(not(feature = "time"))]
     pub fn get_timestamp() -> Object {
@@ -224,5 +299,59 @@ pub mod tests {
         // Save to file
         save_document(&file_path, &mut doc);
         assert!(file_path.exists());
+    }
+
+    #[test]
+    fn test_add_font_embeds_font_correctly() {
+        // Create a dummy TTF font in memory (fake content, just to test structure)
+        let font_file = std::fs::read("./tests/resources/fonts/Montserrat-Regular.ttf").unwrap();
+
+        // Construct FontData manually
+        let mut font_data = FontData::new(&font_file, "MyFont".to_string());
+        font_data
+            .set_flags(32)
+            .set_font_bbox((0, -200, 1000, 800))
+            .set_italic_angle(0)
+            .set_ascent(750)
+            .set_descent(-250)
+            .set_cap_height(700)
+            .set_stem_v(80)
+            .set_encoding("WinAnsiEncoding".to_string());
+
+        // Create PDF document
+        let mut doc = Document::with_version("1.5");
+
+        // Create dummy page
+        let page_id = doc.new_object_id();
+        doc.set_object(page_id, dictionary! {});
+
+        // Add font
+        let font_id = doc.add_font(font_data.clone()).unwrap();
+
+        // Font dictionary must exist
+        let font_obj = doc.get_object(font_id).unwrap();
+        let font_dict = font_obj.as_dict().unwrap();
+
+        // Check base font name
+        assert_eq!(font_dict.get(b"BaseFont").unwrap(), &Object::Name(b"MyFont".to_vec()));
+
+        // Check encoding
+        assert_eq!(
+            font_dict.get(b"Encoding").unwrap(),
+            &Object::Name(b"WinAnsiEncoding".to_vec())
+        );
+
+        // Check font descriptor exists and is referenced
+        let descriptor_ref = font_dict.get(b"FontDescriptor").unwrap().as_reference().unwrap();
+        let descriptor_obj = doc.get_object(descriptor_ref).unwrap().as_dict().unwrap();
+        assert_eq!(
+            descriptor_obj.get(b"FontName").unwrap(),
+            &Object::Name(b"MyFont".to_vec())
+        );
+
+        // Check font file is embedded
+        let font_file_ref = descriptor_obj.get(b"FontFile2").unwrap().as_reference().unwrap();
+        let font_stream = doc.get_object(font_file_ref).unwrap().as_stream().unwrap();
+        assert_eq!(font_stream.content, font_file);
     }
 }

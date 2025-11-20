@@ -1,5 +1,9 @@
 target
 Cargo.lock
 test*.pdf
-.idea
 *.pdf
+.idea
+*log.txt
+specs
+.DS_Store
+/notes

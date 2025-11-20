@@ -2,10 +2,26 @@ use std::sync::{Arc, atomic::AtomicBool};
 
 use lopdf::{Document, Result};
 
+#[cfg(feature = "async")]
+use tokio::runtime::Builder;
+
+#[cfg(not(feature = "async"))]
+fn load_document(path: &str) -> Result<Document> {
+    let stop = Arc::new(AtomicBool::new(false));
+    Document::load(path, stop)
+}
+
+#[cfg(feature = "async")]
+fn load_document(path: &str) -> Result<Document> {
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move { Document::load(path).await })
+}
 fn main() -> Result<()> {
     // Load a PDF document
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut doc = Document::load("example.pdf", stop)?;
+    let mut doc = load_document("example.pdf")?;
 
     println!("Loaded PDF document");
 
@@ -62,8 +78,7 @@ fn main() -> Result<()> {
     println!("\n=== Comparison with original replace_text ===");
 
     // This would fail with replace_text because it requires exact match
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut doc2 = Document::load("example.pdf", stop)?;
+    let mut doc2 = load_document("example.pdf")?;
 
     // Original replace_text - needs exact match
     match doc2.replace_text(1, "Hello World!", "Hi Earth!", None) {

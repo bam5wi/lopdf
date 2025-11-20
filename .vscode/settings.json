@@ -1,9 +1,19 @@
 {
+    "git.ignoreLimitWarning": true,
+    "files.eol": "\n",
 	"editor.formatOnSave": true,
-	"[markdown]": {
-		"editor.formatOnSave": false
-	},
 	"search.exclude": {
 		"target": true
-	}
+	},
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.black-formatter"
+    },
+    "[markdown]": {
+        "editor.formatOnSave": true,
+        "editor.formatOnPaste": true
+    },
+    "markdownlint.config": {
+        "MD013": false,
+        "MD024": false
+    }
 }

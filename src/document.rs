@@ -263,9 +263,14 @@ impl Document {
             .and_then(|id| self.get_dictionary(id))
     }
 
-    /// Return true is PDF document is encrypted
+    /// Return true if PDF document is currently encrypted
     pub fn is_encrypted(&self) -> bool {
         self.get_encrypted().is_ok()
+    }
+
+    /// Return true if the document was originally encrypted when loaded
+    pub fn was_encrypted(&self) -> bool {
+        self.encryption_state.is_some()
     }
 
     /// Authenticate the provided owner password directly as bytes without sanitization
@@ -694,7 +699,15 @@ impl Document {
         let mut images = vec![];
         if let Ok(page) = self.get_dictionary(page_id) {
             let resources = self.get_dict_in_dict(page, b"Resources")?;
-            let xobject = self.get_dict_in_dict(resources, b"XObject")?;
+            let xobject = match self.get_dict_in_dict(resources, b"XObject") {
+                Ok(xobject) => xobject,
+                Err(err) => match err {
+                    // XObject is optional, no images found
+                    Error::DictKey(_) => return Ok(Vec::default()),
+                    _ => Err(err)?,
+                },
+            };
+
             for (_, xvalue) in xobject.iter() {
                 let id = xvalue.as_reference()?;
                 let xvalue = self.get_object(id)?;

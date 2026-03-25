@@ -16,6 +16,17 @@
 			"target": "./pdfutil/target/debug/pdfutil",
 			"arguments": "decompress -i /Users/Junfeng/Downloads/Lifetimes.pdf",
 			"cwd": "${workspaceRoot}"
-		}
+		},
+        {
+            "name": "Test 'load_many_shallow_brackets' (Windows VS)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceRoot}/target/debug/deps/lopdf-2d367767440d3aef.exe",
+            "args": ["reader::load_many_shallow_brackets", "--exact", "--nocapture"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}",
+            "environment": [],
+            "console": "integratedTerminal"
+        }
 	]
 }

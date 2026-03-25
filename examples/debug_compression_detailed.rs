@@ -66,9 +66,11 @@ fn main() {
     // Write to file for inspection
     std::fs::write("debug_compression.pdf", &buffer).unwrap();
 
+    let stop = Arc::new(AtomicBool::new(false));
+
     // Load back and check
     println!("\nLoading back and checking object streams...");
-    let loaded = Document::load_mem(&buffer).unwrap();
+    let loaded = Document::load_mem(&buffer, stop).unwrap();
 
     let mut obj_stream_count = 0;
     let mut obj_stream_with_filter = 0;

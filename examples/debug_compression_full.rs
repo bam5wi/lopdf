@@ -122,11 +122,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     doc.save_with_options(&mut buffer, options)?;
     std::fs::write(&output_file, &buffer)?;
 
+    let stop = Arc::new(AtomicBool::new(false));
+
     println!("Saved compressed PDF: {} ({} bytes)", output_file, buffer.len());
 
     // Load compressed PDF back
     println!("\n4. Loading compressed PDF back for analysis...");
-    match Document::load_mem(&buffer) {
+    match Document::load_mem(&buffer, stop) {
         Ok(compressed_doc) => {
             let compressed_analysis = analyze_document(&compressed_doc);
 

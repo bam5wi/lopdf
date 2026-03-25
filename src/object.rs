@@ -676,7 +676,11 @@ impl Stream {
 
     pub fn decompressed_content(&self) -> Result<Vec<u8>> {
         let params = self.dict.get(b"DecodeParms").and_then(Object::as_dict).ok();
-        let filters = self.filters()?;
+        let filters = match self.filters() {
+            Ok(f) => f,
+            // No /Filter key means the stream is uncompressed
+            Err(_) => return Ok(self.content.clone()),
+        };
 
         let mut input = self.content.as_slice();
         let mut output = vec![];
@@ -730,13 +734,22 @@ impl Stream {
         use std::io::prelude::*;
 
         let mut output = Vec::with_capacity(input.len() * 2);
-        let mut decoder = ZlibDecoder::new(input);
 
         if !input.is_empty() {
-            decoder.read_to_end(&mut output).unwrap_or_else(|err| {
+            let mut decoder = ZlibDecoder::new(input);
+            if let Err(err) = decoder.read_to_end(&mut output) {
                 warn!("{err}");
-                0
-            });
+                // Zlib decompression failed (e.g. corrupt adler32 checksum in
+                // encrypted PDFs). Retry with raw deflate, skipping the 2-byte
+                // zlib header and ignoring the checksum.
+                if output.is_empty() && input.len() > 2 {
+                    use flate2::read::DeflateDecoder;
+                    let mut raw_decoder = DeflateDecoder::new(&input[2..]);
+                    if let Err(raw_err) = raw_decoder.read_to_end(&mut output) {
+                        warn!("raw deflate fallback also failed: {raw_err}");
+                    }
+                }
+            }
         }
         Self::decompress_predictor(output, params)
     }
@@ -852,5 +865,45 @@ mod test {
         let output = Stream::decode_ascii85(input);
         // let expected: Result<Vec<u8>, Error> = Err(Error::ContentDecode);
         assert!(matches!(output, Err(Error::Decompress(DecompressError::Ascii85(_)))));
+    }
+
+    #[test]
+    fn test_decompress_zlib_corrupt_checksum() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let original = b"BT /F1 12 Tf (Hello World) Tj ET";
+
+        // Compress with valid zlib
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(original).unwrap();
+        let mut compressed = encoder.finish().unwrap();
+
+        // Corrupt the adler32 checksum (last 4 bytes)
+        let len = compressed.len();
+        assert!(len >= 4);
+        for byte in &mut compressed[len - 4..] {
+            *byte ^= 0xFF;
+        }
+
+        // Normal zlib should fail, but our fallback should recover
+        let result = Stream::decompress_zlib(&compressed, None).unwrap();
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn test_uncompressed_stream_returns_raw_content() {
+        use crate::Dictionary;
+
+        // A stream with no /Filter should return its raw content from decompressed_content()
+        let content = b"/FullPage Do
+".to_vec();
+        let mut dict = Dictionary::new();
+        dict.set("Length", content.len() as i64);
+        let stream = Stream::new(dict, content.clone());
+
+        let result = stream.decompressed_content().expect("should succeed for uncompressed stream");
+        assert_eq!(result, content);
     }
 }

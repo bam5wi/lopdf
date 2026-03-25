@@ -1,28 +1,31 @@
 use lopdf::{Document, SaveOptions};
 use std::fs::File;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 fn main() {
     println!("Testing object stream round-trip...\n");
-    
+
     // First, create a simple PDF with object streams
     let mut doc = Document::with_version("1.5");
-    
+
     // Add a simple page
     let pages_id = doc.new_object_id();
     let page_id = doc.new_object_id();
     let content_id = doc.new_object_id();
     let font_id = doc.new_object_id();
-    
+
     // Page content
     doc.objects.insert(
         content_id,
         lopdf::Stream::new(
             lopdf::dictionary! {},
-            b"BT /F1 12 Tf 100 700 Td (Hello World) Tj ET".to_vec()
-        ).into()
+            b"BT /F1 12 Tf 100 700 Td (Hello World) Tj ET".to_vec(),
+        )
+        .into(),
     );
-    
+
     // Font
     doc.objects.insert(
         font_id,
@@ -30,9 +33,10 @@ fn main() {
             "Type" => "Font",
             "Subtype" => "Type1",
             "BaseFont" => "Helvetica"
-        }.into()
+        }
+        .into(),
     );
-    
+
     // Page
     doc.objects.insert(
         page_id,
@@ -46,9 +50,10 @@ fn main() {
                     "F1" => font_id
                 }
             }
-        }.into()
+        }
+        .into(),
     );
-    
+
     // Pages
     doc.objects.insert(
         pages_id,
@@ -56,37 +61,40 @@ fn main() {
             "Type" => "Pages",
             "Kids" => vec![page_id.into()],
             "Count" => 1
-        }.into()
+        }
+        .into(),
     );
-    
+
     // Catalog
     let catalog_id = doc.add_object(lopdf::dictionary! {
         "Type" => "Catalog",
         "Pages" => pages_id
     });
-    
+
     doc.trailer.set("Root", catalog_id);
-    
+
     // Save with object streams
     println!("Saving original PDF with object streams...");
     let options = SaveOptions {
         use_object_streams: true,
         ..Default::default()
     };
-    
+
     let mut original_bytes = Vec::new();
     doc.save_with_options(&mut original_bytes, options.clone()).unwrap();
     println!("Original size: {} bytes", original_bytes.len());
-    
+
     // Write to file for inspection
     let mut file = File::create("test_roundtrip_original.pdf").unwrap();
     file.write_all(&original_bytes).unwrap();
-    
+
+    let stop = Arc::new(AtomicBool::new(false));
+
     // Now load it back
     println!("\nLoading PDF back...");
-    let mut loaded_doc = Document::load_mem(&original_bytes).unwrap();
+    let mut loaded_doc = Document::load_mem(&original_bytes, stop).unwrap();
     println!("Loaded {} objects", loaded_doc.objects.len());
-    
+
     // Check for object streams
     let mut obj_stream_count = 0;
     for (id, obj) in &loaded_doc.objects {
@@ -107,16 +115,16 @@ fn main() {
         }
     }
     println!("Total object streams found: {}", obj_stream_count);
-    
+
     // Save again with object streams
     println!("\nSaving loaded PDF with object streams again...");
     let mut resaved_bytes = Vec::new();
     loaded_doc.save_with_options(&mut resaved_bytes, options).unwrap();
     println!("Resaved size: {} bytes", resaved_bytes.len());
-    
+
     // Write to file for inspection
     let mut file = File::create("test_roundtrip_resaved.pdf").unwrap();
     file.write_all(&resaved_bytes).unwrap();
-    
+
     println!("\nDone! Check test_roundtrip_original.pdf and test_roundtrip_resaved.pdf");
 }

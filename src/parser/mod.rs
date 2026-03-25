@@ -409,15 +409,28 @@ fn _indirect_object<'a>(
     Ok((object_id, object))
 }
 
-pub fn header(input: ParserInput) -> Option<String> {
-    strip_nom(map_res(
-        delimited(
-            tag(&b"%PDF-"[..]),
+pub fn header(input: ParserInput, strict: bool) -> Option<String> {
+    // Parse version digits (e.g. "1.7") separately from any trailing bytes
+    // before the newline.  Some PDF generators (e.g. ImageMill) place binary
+    // marker bytes on the header line which would fail UTF-8 validation.
+    // In strict mode we reject such trailing bytes; in lenient mode we skip them.
+    let (_, (version_raw, trailing)) = delimited(
+        tag(&b"%PDF-"[..]),
+        pair(
+            take_while(|c: u8| c.is_ascii_digit() || c == b'.'),
             take_while(|c: u8| !b"\r\n".contains(&c)),
-            pair(eol, many0_count(comment)),
         ),
-        |v: ParserInput| str::from_utf8(&v).map(Into::into),
-    ).parse(input))
+        pair(eol, many0_count(comment)),
+    )
+    .parse(input)
+    .ok()?;
+
+    if strict && !trailing.is_empty() {
+        return None;
+    }
+
+    let version = str::from_utf8(&version_raw).ok()?.to_string();
+    Some(version)
 }
 
 pub fn binary_mark(input: ParserInput) -> Option<Vec<u8>> {
@@ -558,9 +571,33 @@ fn inline_image(input: ParserInput) -> NomResult<(Vec<Object>, String)> {
 fn inline_image_impl(input: ParserInput) -> NomResult<(Vec<Object>, String)> {
     let (input, stream_dict) = inner_dictionary.parse(input)?;
     let (input, _) = pair(tag(&b"ID"[..]), content_space).parse(input)?;
-    let (_, (input, stream)) = convert_result(image_data_stream(input, stream_dict), input, ErrorKind::Fail)?;
-    let (input, _) = (content_space, tag(&b"EI"[..]), content_space).parse(input)?;
-    Ok((input, (vec![Object::Stream(stream)], String::from("BI"))))
+    match image_data_stream(input, stream_dict) {
+        Ok((input, stream)) => {
+            let (input, _) = (content_space, tag(&b"EI"[..]), content_space).parse(input)?;
+            Ok((input, (vec![Object::Stream(stream)], String::from("BI"))))
+        }
+        Err(e) => {
+            // Skip to EI marker so the rest of the content stream can still be parsed.
+            log::warn!("Skipping unparseable inline image: {e}");
+            let bytes = input.fragment();
+            // EI must appear after whitespace to distinguish from data bytes.
+            let ei_pos = bytes.windows(4)
+                .position(|w| (w[0] == b' ' || w[0] == b'\n' || w[0] == b'\r')
+                    && w[1] == b'E' && w[2] == b'I'
+                    && (w[3] == b' ' || w[3] == b'\n' || w[3] == b'\r'))
+                .ok_or_else(|| {
+                    let err: NomError = nom::error::Error::from_error_kind(input, ErrorKind::Fail);
+                    nom::Err::Failure(err)
+                })?;
+            let (input, _) = take(ei_pos + 3).parse(input)
+                .map_err(|_: nom::Err<()>| {
+                    let err: NomError = nom::error::Error::from_error_kind(input, ErrorKind::Fail);
+                    nom::Err::Failure(err)
+                })?;
+            let (input, _) = content_space(input)?;
+            Ok((input, (vec![], String::from("BI"))))
+        }
+    }
 }
 
 fn image_data_stream(input: ParserInput, stream_dict: Dictionary) -> crate::Result<(ParserInput, Stream)> {
@@ -779,6 +816,49 @@ startxref
     }
 
     #[test]
+    fn header_standard() {
+        // Standard header with proper EOL
+        let input = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n";
+        assert_eq!(header(test_span(input), false), Some("1.7".to_string()));
+    }
+
+    #[test]
+    fn header_with_binary_bytes_on_same_line() {
+        // Some generators (e.g. ImageMill) place binary marker bytes on the
+        // header line without a separating newline or '%' prefix.
+        let input = b"%PDF-1.3 \xb0\x9f\x92\x9c\x9f\xd4\xe0\xce\xd0\xd0\xd0\r1 0 obj\r";
+        assert_eq!(header(test_span(input), false), Some("1.3".to_string()));
+    }
+
+    #[test]
+    fn header_with_binary_bytes_strict_rejects() {
+        // In strict mode, binary bytes on the header line should cause a
+        // parse failure (the raw bytes are not valid UTF-8).
+        let input = b"%PDF-1.3 \xb0\x9f\x92\x9c\x9f\xd4\xe0\xce\xd0\xd0\xd0\r1 0 obj\r";
+        assert_eq!(header(test_span(input), true), None);
+    }
+
+    #[test]
+    fn header_cr_line_ending() {
+        // CR-only line ending (common in older PDFs)
+        let input = b"%PDF-1.3\r%\xe2\xe3\xcf\xd3\r";
+        assert_eq!(header(test_span(input), false), Some("1.3".to_string()));
+    }
+
+    #[test]
+    fn header_crlf_line_ending() {
+        // CRLF line ending (common on Windows-generated PDFs)
+        let input = b"%PDF-1.7\r\n%\xe2\xe3\xcf\xd3\r\n";
+        assert_eq!(header(test_span(input), false), Some("1.7".to_string()));
+    }
+
+    #[test]
+    fn header_pdf_2_0() {
+        let input = b"%PDF-2.0\n%\xe2\xe3\xcf\xd3\n";
+        assert_eq!(header(test_span(input), false), Some("2.0".to_string()));
+    }
+
+    #[test]
     fn content_with_comments() {
         // It should be processed as usual but ignoring the comments
         let input = b"0.5 0.5 0.5 setrgbcolor
@@ -792,8 +872,26 @@ startxref
     }
 
     #[test]
+    fn inline_image_unknown_colorspace_skipped() {
+        // Inline image with an unrecognized colorspace ("ICCBased" is not handled).
+        // The parser should skip it and still parse the surrounding operations.
+        let input = b"q 100 100 moveto
+BI /W 2 /H 2 /CS /ICCBased /BPC 8
+ID
+\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00
+EI
+(Hello) Tj Q";
+        let out = content(test_span(input)).unwrap();
+        // Should have: q, moveto, BI (skipped), Tj, Q = 5 operations
+        let ops: Vec<&str> = out.operations.iter().map(|o| o.operator.as_str()).collect();
+        assert!(ops.contains(&"q"), "missing q, got: {:?}", ops);
+        assert!(ops.contains(&"Tj"), "missing Tj, got: {:?}", ops);
+        assert!(ops.contains(&"Q"), "missing Q, got: {:?}", ops);
+    }
+
+    #[test]
     fn inline_image() {
-        env_logger::init();
+        let _ = env_logger::try_init();
         let input = b"BI /W 4 /H 4 /CS /RGB /BPC 8
 ID
 00000z0z00zzz00z0zzz0zzzEI aazazaazzzaazazzzazzz

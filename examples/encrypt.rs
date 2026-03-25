@@ -1,6 +1,5 @@
-use lopdf::{Document, EncryptionState, EncryptionVersion, Permissions};
 use lopdf::encryption::crypt_filters::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
-use rand::Rng as _;
+use lopdf::{Document, EncryptionState, EncryptionVersion, Permissions};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -16,12 +15,18 @@ fn main() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut doc = Document::load(input_file, stop).unwrap();
-    let permissions = Permissions::PRINTABLE | Permissions::COPYABLE | Permissions::COPYABLE_FOR_ACCESSIBILITY | Permissions::PRINTABLE_IN_HIGH_QUALITY;
+    let permissions = Permissions::PRINTABLE
+        | Permissions::COPYABLE
+        | Permissions::COPYABLE_FOR_ACCESSIBILITY
+        | Permissions::PRINTABLE_IN_HIGH_QUALITY;
     let mut file_encryption_key = [0u8; 32];
 
     let requested_version = match version {
         1 => {
-            assert!(args.len() >= 6, "Not enough arguments: input_file output_file 1 owner_password user_password");
+            assert!(
+                args.len() >= 6,
+                "Not enough arguments: input_file output_file 1 owner_password user_password"
+            );
 
             let owner_password = &args[4];
             let user_password = &args[5];
@@ -34,11 +39,18 @@ fn main() {
             }
         }
         2 => {
-            assert!(args.len() >= 6, "Not enough arguments: input_file output_file 1 owner_password user_password key_length");
+            assert!(
+                args.len() >= 6,
+                "Not enough arguments: input_file output_file 1 owner_password user_password key_length"
+            );
 
             let owner_password = &args[4];
             let user_password = &args[5];
-            let key_length = if args.len() > 6 { args[6].parse::<usize>().unwrap_or(40) } else { 40 };
+            let key_length = if args.len() > 6 {
+                args[6].parse::<usize>().unwrap_or(40)
+            } else {
+                40
+            };
 
             EncryptionVersion::V2 {
                 document: &doc,
@@ -49,7 +61,10 @@ fn main() {
             }
         }
         4 => {
-            assert!(args.len() >= 6, "Not enough arguments: input_file output_file 1 owner_password user_password");
+            assert!(
+                args.len() >= 6,
+                "Not enough arguments: input_file output_file 1 owner_password user_password"
+            );
 
             let owner_password = &args[4];
             let user_password = &args[5];
@@ -68,7 +83,12 @@ fn main() {
             }
         }
         5 => {
-            assert!(args.len() >= 6, "Not enough arguments: input_file output_file 1 owner_password user_password");
+            use rand::RngExt;
+
+            assert!(
+                args.len() >= 6,
+                "Not enough arguments: input_file output_file 1 owner_password user_password"
+            );
 
             let owner_password = &args[4];
             let user_password = &args[5];
@@ -121,12 +141,18 @@ async fn main() {
     let version = args[3].parse::<i64>().unwrap_or(0);
 
     let mut doc = Document::load(input_file).await.unwrap();
-    let permissions = Permissions::PRINTABLE | Permissions::COPYABLE | Permissions::COPYABLE_FOR_ACCESSIBILITY | Permissions::PRINTABLE_IN_HIGH_QUALITY;
+    let permissions = Permissions::PRINTABLE
+        | Permissions::COPYABLE
+        | Permissions::COPYABLE_FOR_ACCESSIBILITY
+        | Permissions::PRINTABLE_IN_HIGH_QUALITY;
     let mut file_encryption_key = [0u8; 32];
 
     let requested_version = match version {
         1 => {
-            assert!(args.len() >= 6, "Not enough arguments: input_file output_file 1 owner_password user_password");
+            assert!(
+                args.len() >= 6,
+                "Not enough arguments: input_file output_file 1 owner_password user_password"
+            );
 
             let owner_password = &args[4];
             let user_password = &args[5];
@@ -139,11 +165,18 @@ async fn main() {
             }
         }
         2 => {
-            assert!(args.len() >= 6, "Not enough arguments: input_file output_file 1 owner_password user_password key_length");
+            assert!(
+                args.len() >= 6,
+                "Not enough arguments: input_file output_file 1 owner_password user_password key_length"
+            );
 
             let owner_password = &args[4];
             let user_password = &args[5];
-            let key_length = if args.len() > 6 { args[6].parse::<usize>().unwrap_or(40) } else { 40 };
+            let key_length = if args.len() > 6 {
+                args[6].parse::<usize>().unwrap_or(40)
+            } else {
+                40
+            };
 
             EncryptionVersion::V2 {
                 document: &doc,
@@ -154,7 +187,10 @@ async fn main() {
             }
         }
         4 => {
-            assert!(args.len() >= 6, "Not enough arguments: input_file output_file 1 owner_password user_password");
+            assert!(
+                args.len() >= 6,
+                "Not enough arguments: input_file output_file 1 owner_password user_password"
+            );
 
             let owner_password = &args[4];
             let user_password = &args[5];
@@ -173,7 +209,10 @@ async fn main() {
             }
         }
         5 => {
-            assert!(args.len() >= 6, "Not enough arguments: input_file output_file 1 owner_password user_password");
+            assert!(
+                args.len() >= 6,
+                "Not enough arguments: input_file output_file 1 owner_password user_password"
+            );
 
             let owner_password = &args[4];
             let user_password = &args[5];
@@ -213,5 +252,4 @@ async fn main() {
 
     // Store file in current working directory.
     doc.save(output_file).unwrap();
-
 }

@@ -19,6 +19,7 @@ fn load_document(path: &str) -> Result<Document> {
         .unwrap()
         .block_on(async move { Document::load(path).await })
 }
+
 fn main() -> Result<()> {
     // Load a PDF document
     let mut doc = load_document("example.pdf")?;

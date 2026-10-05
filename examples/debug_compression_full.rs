@@ -4,8 +4,12 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::{Arc, atomic::AtomicBool};
 
-use lopdf::{Document, Object, ObjectStream, SaveOptions};
+type ObjectId = (u32, u16);
+type ReferenceLocations = HashMap<ObjectId, (String, ObjectId)>;
 
+#[cfg(not(feature = "async"))]
+use lopdf::Document;
+use lopdf::{Object, ObjectStream, SaveOptions};
 #[cfg(feature = "async")]
 use tokio::runtime::Builder;
 
@@ -85,14 +89,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Log why it's not compressible
             if matches!(obj, Object::Stream(_)) {
                 writeln!(debug_log, "    Reason: Is a stream object")?;
-            } else if let Object::Dictionary(dict) = obj {
-                if let Ok(type_obj) = dict.get(b"Type") {
-                    if let Ok(type_name) = type_obj.as_name() {
-                        if type_name == b"Page" || type_name == b"Pages" {
-                            writeln!(debug_log, "    Reason: Is a Page/Pages object")?;
-                        }
-                    }
-                }
+            } else if let Object::Dictionary(dict) = obj
+                && let Ok(type_obj) = dict.get(b"Type")
+                && let Ok(type_name) = type_obj.as_name()
+                && (type_name == b"Page" || type_name == b"Pages")
+            {
+                writeln!(debug_log, "    Reason: Is a Page/Pages object")?;
             }
 
             // Check if in trailer
@@ -122,12 +124,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     doc.save_with_options(&mut buffer, options)?;
     std::fs::write(&output_file, &buffer)?;
 
-    let stop = Arc::new(AtomicBool::new(false));
-
     println!("Saved compressed PDF: {} ({} bytes)", output_file, buffer.len());
 
     // Load compressed PDF back
     println!("\n4. Loading compressed PDF back for analysis...");
+    let stop = Arc::new(AtomicBool::new(false));
     match Document::load_mem(&buffer, stop) {
         Ok(compressed_doc) => {
             let compressed_analysis = analyze_document(&compressed_doc);
@@ -191,7 +192,7 @@ fn analyze_document(doc: &Document) -> DocumentAnalysis {
     };
 
     // Count compressed objects
-    for (_id, xref_entry) in &doc.reference_table.entries {
+    for xref_entry in doc.reference_table.entries.values() {
         if let lopdf::xref::XrefEntry::Compressed { .. } = xref_entry {
             analysis.compressed_objects += 1;
         }
@@ -202,23 +203,22 @@ fn analyze_document(doc: &Document) -> DocumentAnalysis {
         match obj {
             Object::Stream(stream) => {
                 analysis.streams += 1;
-                if let Ok(type_obj) = stream.dict.get(b"Type") {
-                    if let Ok(type_name) = type_obj.as_name() {
-                        if type_name == b"ObjStm" {
-                            analysis.object_streams += 1;
-                        }
-                    }
+                if let Ok(type_obj) = stream.dict.get(b"Type")
+                    && let Ok(type_name) = type_obj.as_name()
+                    && type_name == b"ObjStm"
+                {
+                    analysis.object_streams += 1;
                 }
             }
             Object::Dictionary(dict) => {
                 analysis.dictionaries += 1;
-                if let Ok(type_obj) = dict.get(b"Type") {
-                    if let Ok(type_name) = type_obj.as_name() {
-                        match type_name {
-                            b"Page" => analysis.page_objects.push(id),
-                            b"Font" => analysis.fonts.push(id),
-                            _ => {}
-                        }
+                if let Ok(type_obj) = dict.get(b"Type")
+                    && let Ok(type_name) = type_obj.as_name()
+                {
+                    match type_name {
+                        b"Page" => analysis.page_objects.push(id),
+                        b"Font" => analysis.fonts.push(id),
+                        _ => {}
                     }
                 }
             }
@@ -229,21 +229,21 @@ fn analyze_document(doc: &Document) -> DocumentAnalysis {
 
     // Find content streams
     for &page_id in &analysis.page_objects {
-        if let Ok(page_obj) = doc.get_object(page_id) {
-            if let Object::Dictionary(page_dict) = page_obj {
-                match page_dict.get(b"Contents") {
-                    Ok(Object::Reference(content_id)) => {
-                        analysis.content_streams.push(*content_id);
-                    }
-                    Ok(Object::Array(contents)) => {
-                        for content_ref in contents {
-                            if let Object::Reference(content_id) = content_ref {
-                                analysis.content_streams.push(*content_id);
-                            }
+        if let Ok(page_obj) = doc.get_object(page_id)
+            && let Object::Dictionary(page_dict) = page_obj
+        {
+            match page_dict.get(b"Contents") {
+                Ok(Object::Reference(content_id)) => {
+                    analysis.content_streams.push(*content_id);
+                }
+                Ok(Object::Array(contents)) => {
+                    for content_ref in contents {
+                        if let Object::Reference(content_id) = content_ref {
+                            analysis.content_streams.push(*content_id);
                         }
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
@@ -343,14 +343,14 @@ fn verify_critical_objects(doc: &Document, log: &mut File) -> std::io::Result<()
                 )?;
 
                 // Check if it's compressed
-                if let Some(xref) = doc.reference_table.get(page_id.0) {
-                    if let lopdf::xref::XrefEntry::Compressed { container, index } = xref {
-                        writeln!(
-                            log,
-                            "  ERROR: Page is compressed in stream {} at index {}!",
-                            container, index
-                        )?;
-                    }
+                if let Some(xref) = doc.reference_table.get(page_id.0)
+                    && let lopdf::xref::XrefEntry::Compressed { container, index } = xref
+                {
+                    writeln!(
+                        log,
+                        "  ERROR: Page is compressed in stream {} at index {}!",
+                        container, index
+                    )?;
                 }
 
                 // Check page contents
@@ -411,17 +411,17 @@ fn check_orphaned_references(doc: &Document, log: &mut File) -> std::io::Result<
         match doc.get_object(*ref_id) {
             Ok(_) => {
                 // Check if it's in a compressed stream
-                if let Some(xref) = doc.reference_table.get(ref_id.0) {
-                    if let lopdf::xref::XrefEntry::Compressed { container, .. } = xref {
-                        // Make sure the container exists
-                        if doc.get_object((*container, 0)).is_err() {
-                            writeln!(
-                                log,
-                                "ERROR: Reference {} {} R from {} ({} {} R) points to compressed object in non-existent stream {}!",
-                                ref_id.0, ref_id.1, location, from_id.0, from_id.1, container
-                            )?;
-                            orphaned_count += 1;
-                        }
+                if let Some(xref) = doc.reference_table.get(ref_id.0)
+                    && let lopdf::xref::XrefEntry::Compressed { container, .. } = xref
+                {
+                    // Make sure the container exists
+                    if doc.get_object((*container, 0)).is_err() {
+                        writeln!(
+                            log,
+                            "ERROR: Reference {} {} R from {} ({} {} R) points to compressed object in non-existent stream {}!",
+                            ref_id.0, ref_id.1, location, from_id.0, from_id.1, container
+                        )?;
+                        orphaned_count += 1;
                     }
                 }
             }
@@ -442,7 +442,7 @@ fn check_orphaned_references(doc: &Document, log: &mut File) -> std::io::Result<
     Ok(())
 }
 
-fn collect_references(obj: &Object, refs: &mut HashMap<(u32, u16), (String, (u32, u16))>, from_id: (u32, u16)) {
+fn collect_references(obj: &Object, refs: &mut ReferenceLocations, from_id: ObjectId) {
     match obj {
         Object::Reference(ref_id) => {
             refs.insert(*ref_id, ("direct".to_string(), from_id));
@@ -497,7 +497,7 @@ fn validate_with_external_tools(pdf_path: &str) {
 
     // Try to use qpdf if available
     println!("\nTrying qpdf --check...");
-    match std::process::Command::new("qpdf").args(&["--check", pdf_path]).output() {
+    match std::process::Command::new("qpdf").args(["--check", pdf_path]).output() {
         Ok(output) => {
             if output.status.success() {
                 println!("✓ qpdf validation passed");
@@ -513,7 +513,7 @@ fn validate_with_external_tools(pdf_path: &str) {
 
     // Try to use mutool if available
     println!("\nTrying mutool info...");
-    match std::process::Command::new("mutool").args(&["info", pdf_path]).output() {
+    match std::process::Command::new("mutool").args(["info", pdf_path]).output() {
         Ok(output) => {
             if output.status.success() {
                 println!("✓ mutool validation passed");

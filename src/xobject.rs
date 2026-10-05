@@ -74,7 +74,7 @@ pub fn image_from(buffer: Vec<u8>) -> Result<Stream> {
         _ => {
             return Err(Error::Unimplemented(
                 "The image crate supports a new color type, but lopdf has not been updated yet",
-            ))
+            ));
         }
     };
 
@@ -139,7 +139,7 @@ pub fn image_from(buffer: Vec<u8>) -> Result<Stream> {
             _ => {
                 return Err(Error::Unimplemented(
                     "The image library supports a new color type, but lopdf has not been updated yet",
-                ))
+                ));
             }
         };
 
@@ -182,7 +182,7 @@ async fn insert_image() {
     use super::xobject;
     let mut doc = Document::load("assets/example.pdf").await.unwrap();
     let pages = doc.get_pages();
-    let page_id = *pages.get(&1).expect(&format!("Page {} not exist.", 1));
+    let page_id = *pages.get(&1).unwrap_or_else(|| panic!("Page {} not exist.", 1));
     let img = xobject::image("assets/pdf_icon.jpg").unwrap();
     doc.insert_image(page_id, img, (100.0, 210.0), (400.0, 225.0)).unwrap();
     doc.save("test_5_image.pdf").unwrap();
@@ -208,8 +208,6 @@ fn embed_supported_color_type() -> Result<()> {
     for img_path in img_paths {
         let img = image::open(&img_path)?;
         let (width, height) = img.dimensions();
-        let color_type = img.color();
-        println!("Image: {img_path:?}, width: {width}, height: {height}, color type: {color_type:?}");
 
         let image_stream = xobject::image(img_path)?;
 

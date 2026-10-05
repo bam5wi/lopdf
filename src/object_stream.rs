@@ -1,4 +1,4 @@
-use crate::parser::{self, ParserInput};
+use crate::parser;
 use crate::{Document, Error, Object, ObjectId, Result, Stream};
 use std::collections::BTreeMap;
 use std::num::TryFromIntError;
@@ -37,11 +37,28 @@ impl Default for ObjectStreamConfig {
 }
 
 impl ObjectStream {
-    /// Parse an existing object stream
-    pub fn new(stream: &mut Stream) -> Result<ObjectStream> {
-        let _ = stream.decompress();
+    /// Parse an existing object stream without modifying its encoded content or
+    /// filter dictionary.
+    ///
+    /// This decodes the stream without any size limit. For untrusted input,
+    /// prefer [`ObjectStream::new_with_limit`] to guard against decompression
+    /// bombs.
+    pub fn new(stream: &Stream) -> Result<ObjectStream> {
+        Self::new_with_limit(stream, None)
+    }
 
-        if stream.content.is_empty() {
+    /// Parse an existing object stream without modifying it, rejecting the
+    /// decoded content if it would exceed `max_decompressed_size` bytes. `None`
+    /// means no limit (the behavior of [`ObjectStream::new`]).
+    pub fn new_with_limit(stream: &Stream, max_decompressed_size: Option<usize>) -> Result<ObjectStream> {
+        let content = match max_decompressed_size {
+            // Object streams are decoded while the document is loaded, so
+            // enforcing the limit here bounds the memory a single stream can use.
+            Some(max) => stream.get_plain_content_with_limit(max)?,
+            None => stream.get_plain_content()?,
+        };
+
+        if content.is_empty() {
             return Ok(ObjectStream {
                 objects: BTreeMap::new(),
                 max_objects: 100,
@@ -55,10 +72,7 @@ impl ObjectStream {
             .and_then(Object::as_i64)?
             .try_into()
             .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
-        let index_block = stream
-            .content
-            .get(..first_offset)
-            .ok_or(Error::InvalidOffset(first_offset))?;
+        let index_block = content.get(..first_offset).ok_or(Error::InvalidOffset(first_offset))?;
 
         let numbers_str = std::str::from_utf8(index_block).map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
         let numbers: Vec<_> = numbers_str
@@ -76,20 +90,20 @@ impl ObjectStream {
             let id = chunk[0]?;
             let offset = first_offset + chunk[1]? as usize;
 
-            if offset >= stream.content.len() {
+            if offset >= content.len() {
                 warn!("out-of-bounds offset in object stream");
                 return None;
             }
             // Skip leading whitespace — some PDFs emit newlines before objects in ObjStm
             let mut start = offset;
-            while start < stream.content.len() && stream.content[start].is_ascii_whitespace() {
+            while start < content.len() && content[start].is_ascii_whitespace() {
                 start += 1;
             }
-            if start >= stream.content.len() {
+            if start >= content.len() {
                 warn!("only whitespace after offset in object stream");
                 return None;
             }
-            let object = parser::direct_object(ParserInput::new_extra(&stream.content[start..], "direct object"))?;
+            let object = parser::direct_object(&content[start..])?;
 
             Some(((id, 0), object))
         };
@@ -98,7 +112,7 @@ impl ObjectStream {
         #[cfg(not(feature = "rayon"))]
         let objects = numbers[..len].chunks(2).filter_map(chunks_filter_map).collect();
 
-        Ok(ObjectStream { 
+        Ok(ObjectStream {
             objects,
             max_objects: 100,
             compression_level: 6,
@@ -117,7 +131,9 @@ impl ObjectStream {
     pub fn add_object(&mut self, id: ObjectId, obj: Object) -> Result<()> {
         // Check if object can be added to stream
         if matches!(obj, Object::Stream(_)) {
-            return Err(Error::InvalidObjectStream("Stream objects cannot be stored in object streams".into()));
+            return Err(Error::InvalidObjectStream(
+                "Stream objects cannot be stored in object streams".into(),
+            ));
         }
 
         // Check capacity
@@ -137,74 +153,81 @@ impl ObjectStream {
         self.objects.len()
     }
 
+    /// The members in id order, each paired with its serialization: an object
+    /// stream stores them sorted, and both the offset table and the body walk
+    /// them in that order. The order comes from [`Self::sorted_object_ids`], so
+    /// the body and the cross-reference indices cannot drift apart.
+    fn sorted_serializations(&self) -> Result<Vec<(ObjectId, Vec<u8>)>> {
+        self.sorted_object_ids()
+            .into_iter()
+            .map(|id| {
+                let mut bytes = Vec::new();
+                crate::writer::Writer::write_object(&mut bytes, &self.objects[&id])?;
+                Ok((id, bytes))
+            })
+            .collect()
+    }
+
+    /// The contained object ids in the order [`Self::build_stream_content`]
+    /// writes them, so a caller recording cross-reference entries can assign
+    /// each object the index it actually occupies in the stream. This is the
+    /// single source of that order.
+    pub(crate) fn sorted_object_ids(&self) -> Vec<ObjectId> {
+        let mut ids: Vec<ObjectId> = self.objects.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The `N M N M ...` header of object numbers and their offsets from the
+    /// start of the body, which the `/First` entry records the length of.
+    fn offset_table(members: &[(ObjectId, Vec<u8>)]) -> String {
+        let mut entries = Vec::with_capacity(members.len());
+        let mut current_offset = 0;
+
+        for ((obj_num, _gen), bytes) in members {
+            entries.push(format!("{obj_num} {current_offset}"));
+            // +1 for the space separator written after each object
+            current_offset += bytes.len() + 1;
+        }
+
+        // Joined with spaces and a trailing space, so the body starts on a
+        // fresh token.
+        entries.join(" ") + " "
+    }
+
     /// Build the stream content in the format required by PDF spec
     pub fn build_stream_content(&self) -> Result<Vec<u8>> {
+        self.build_body().map(|(content, _)| content)
+    }
+
+    /// The object stream body — the offset table followed by the serialized
+    /// objects — together with the `/First` offset, which is where the table
+    /// ends. Both are needed to build the stream, so they are produced together
+    /// rather than by serializing the members twice.
+    fn build_body(&self) -> Result<(Vec<u8>, usize)> {
         if self.objects.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
-        // Sort objects by ID for consistent output
-        let mut sorted_objects: Vec<_> = self.objects.iter().collect();
-        sorted_objects.sort_by_key(|(id, _)| *id);
+        let members = self.sorted_serializations()?;
+        let table = Self::offset_table(&members);
+        let first_offset = table.len();
 
-        // First build the offset table to know its size
-        let mut offset_entries = Vec::new();
-        let mut current_offset = 0;
-        
-        for ((obj_num, _gen), obj) in &sorted_objects {
-            // Store the object number and its offset
-            offset_entries.push(format!("{obj_num} {current_offset}"));
-            
-            // Calculate size of this object's serialization
-            let mut obj_bytes = Vec::new();
-            crate::writer::Writer::write_object(&mut obj_bytes, obj)?;
-            current_offset += obj_bytes.len() + 1; // +1 for space separator
-        }
-
-        // Build the complete offset table with proper spacing
-        let offset_table = offset_entries.join(" ") + " ";
-        
-        // Now build the final content
         let mut content = Vec::new();
-        content.extend_from_slice(offset_table.as_bytes());
-        
-        // Add serialized objects with space separators
-        for ((_, _), obj) in &sorted_objects {
-            let mut obj_bytes = Vec::new();
-            crate::writer::Writer::write_object(&mut obj_bytes, obj)?;
-            content.extend_from_slice(&obj_bytes);
+        content.extend_from_slice(table.as_bytes());
+
+        for (_, bytes) in &members {
+            content.extend_from_slice(bytes);
             content.push(b' '); // Space separator between objects
         }
 
-        Ok(content)
+        Ok((content, first_offset))
     }
 
     /// Convert to a Stream object ready for insertion into a PDF
     pub fn to_stream_object(&self) -> Result<Stream> {
-        let content = self.build_stream_content()?;
-        
-        // Calculate where the first object starts
-        // We need to find the size of the offset table
-        let mut sorted_objects: Vec<_> = self.objects.iter().collect();
-        sorted_objects.sort_by_key(|(id, _)| *id);
-        
-        // Build the offset entries to calculate exact size
-        let mut offset_entries = Vec::new();
-        let mut current_offset = 0;
-        
-        for ((obj_num, _gen), obj) in &sorted_objects {
-            offset_entries.push(format!("{obj_num} {current_offset}"));
-            
-            // Calculate size of this object's serialization
-            let mut obj_bytes = Vec::new();
-            crate::writer::Writer::write_object(&mut obj_bytes, obj)?;
-            current_offset += obj_bytes.len() + 1; // +1 for space separator
-        }
-        
-        // The offset table is joined with spaces and has a trailing space
-        let offset_table = offset_entries.join(" ") + " ";
-        let first_offset = offset_table.len();
-        
+        let (content, first_offset) = self.build_body()?;
+
         let dict = dictionary! {
             "Type" => "ObjStm",
             "N" => self.objects.len() as i64,
@@ -212,25 +235,10 @@ impl ObjectStream {
         };
 
         let mut stream = Stream::new(dict, content);
-        
+
         // Apply compression - object streams should always be compressed
         if self.compression_level > 0 {
-            // Force compression by setting Filter directly
-            use flate2::write::ZlibEncoder;
-            use flate2::Compression;
-            use std::io::prelude::*;
-            
-            let compression = match self.compression_level {
-                0 => Compression::none(),
-                1..=3 => Compression::fast(),
-                4..=6 => Compression::default(),
-                _ => Compression::best(),
-            };
-            
-            let mut encoder = ZlibEncoder::new(Vec::new(), compression);
-            encoder.write_all(&stream.content)?;
-            let compressed = encoder.finish()?;
-            
+            let compressed = crate::object::zlib_compress(&stream.content, self.compression_level)?;
             stream.dict.set("Filter", "FlateDecode");
             stream.set_content(compressed);
         }
@@ -244,57 +252,53 @@ impl ObjectStream {
         if matches!(obj, Object::Stream(_)) {
             return false;
         }
-        
+
         // Rule 2: Objects with non-zero generation cannot be compressed
         if id.1 != 0 {
             return false;
         }
-        
+
         // Rule 3: Only encryption dictionary cannot be compressed from trailer references
-        if let Ok(Object::Reference(encrypt_ref)) = doc.trailer.get(b"Encrypt") {
-            if id == *encrypt_ref {
-                return false;
-            }
+        if let Ok(Object::Reference(encrypt_ref)) = doc.trailer.get(b"Encrypt")
+            && id == *encrypt_ref
+        {
+            return false;
         }
-        
+
         // Rule 4: Specific object types that cannot be compressed
-        if let Object::Dictionary(dict) = obj {
-            if let Ok(type_obj) = dict.get(b"Type") {
-                if let Ok(type_name) = type_obj.as_name() {
-                    match type_name {
-                        // Cross-reference streams and object streams cannot be compressed
-                        b"XRef" => return false,
-                        b"ObjStm" => return false,
-                        
-                        // Catalog can only be excluded in linearized PDFs
-                        b"Catalog" => {
-                            // Check if PDF is linearized
-                            if Self::is_linearized(doc) {
-                                return false;
-                            }
-                        }
-                        
-                        // Page, Pages, and all other types CAN be compressed
-                        _ => {}
-                    }
+        if let Object::Dictionary(dict) = obj
+            && let Ok(type_obj) = dict.get(b"Type")
+            && let Ok(type_name) = type_obj.as_name()
+        {
+            match type_name {
+                // Cross-reference streams and object streams cannot be compressed
+                b"XRef" => return false,
+                b"ObjStm" => return false,
+
+                // Catalog can only be excluded in linearized PDFs
+                b"Catalog" if Self::is_linearized(doc) => {
+                    return false;
                 }
+                b"Catalog" => {}
+
+                // Page, Pages, and all other types CAN be compressed
+                _ => {}
             }
         }
-        
+
         // Default: Allow compression
         true
     }
-    
+
     /// Check if a PDF document is linearized
     fn is_linearized(doc: &Document) -> bool {
-        // In a linearized PDF, the first object after the header should be a 
-        // linearization dictionary with /Linearized entry
-        // For simplicity, we check if any object has a /Linearized entry
+        // In a linearized PDF the first object is a linearization dictionary; we just look for
+        // any object with a /Linearized entry.
         for obj in doc.objects.values() {
-            if let Object::Dictionary(dict) = obj {
-                if dict.has(b"Linearized") {
-                    return true;
-                }
+            if let Object::Dictionary(dict) = obj
+                && dict.has(b"Linearized")
+            {
+                return true;
             }
         }
         false

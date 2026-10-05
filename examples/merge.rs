@@ -78,9 +78,8 @@ fn main() {
     let mut documents_objects = BTreeMap::new();
     let mut document = Document::with_version("1.5");
 
-    // Lets try to set these to be bigger to avoid multi allocations for faster handling of files.
-    // We are just saying each Document it about 1000 objects in size. can be adjusted for better speeds.
-    // This can only be used if you use nightly or the #![feature(extend_one)] is stablized.
+    // Preallocating avoids repeated reallocation, assuming ~1000 objects per document.
+    // Requires nightly (`extend_reserve`), so it is commented out.
     // documents_pages.extend_reserve(documents.len() * 1000);
     // documents_objects.extend_reserve(documents.len() * 1000);
 
@@ -91,9 +90,7 @@ fn main() {
         None,
     ));
 
-    // Can set bookmark formatting and color per report bookmark added.
-    // Formating is 1 for italic 2 for bold 3 for bold and italic
-    // Color is RGB 0.0..255.0
+    // Bookmark formatting is 1 italic, 2 bold, 3 bold-italic; color is RGB 0.0..255.0.
     for (layer, mut doc) in documents {
         let color = [0.0, 0.0, 0.0];
         let format = 0;
@@ -108,7 +105,9 @@ fn main() {
         let pages = doc.get_pages();
 
         // This is actually better than extend as we use less allocations and cloning then.
-        pages.into_values().map(|object_id| {
+        pages
+            .into_values()
+            .map(|object_id| {
                 // We use this as the return object for Bookmarking to deturmine what it points too.
                 // We only want to do this for the first page though.
                 if first_object.is_none() {
@@ -128,13 +127,7 @@ fn main() {
         // Lets shadow our pointer back if nothing then set to (0,0) tto point to the next page
         let object = first_object.unwrap_or((0, 0));
 
-        // This will use the layering to implement children under Parents in the bookmarks
-        // Example as we are generating it here.
-        // Table of Contents
-        // - Page 1
-        // -- Page 2
-        // -- Page 3
-        // --- Page 4
+        // Layering nests bookmarks: - Page 1, -- Page 2/3, --- Page 4.
 
         if layer == 0 {
             layer_parent[0] = Some(document.add_bookmark(Bookmark::new(display, color, format, object), None));
@@ -186,10 +179,10 @@ fn main() {
                 // We have also to merge all dictionaries of the old and the new "Pages" object
                 if let Ok(dictionary) = object.as_dict() {
                     let mut dictionary = dictionary.clone();
-                    if let Some((_, ref object)) = pages_object {
-                        if let Ok(old_dictionary) = object.as_dict() {
-                            dictionary.extend(old_dictionary);
-                        }
+                    if let Some((_, ref object)) = pages_object
+                        && let Ok(old_dictionary) = object.as_dict()
+                    {
+                        dictionary.extend(old_dictionary);
                     }
 
                     pages_object = Some((
@@ -248,8 +241,7 @@ fn main() {
         // Set new "Kids" list (collected from documents pages) for "Pages"
         dictionary.set(
             "Kids",
-            documents_pages.into_keys().map(|object_id| Object::Reference(object_id))
-                .collect::<Vec<_>>(),
+            documents_pages.into_keys().map(Object::Reference).collect::<Vec<_>>(),
         );
 
         document.objects.insert(page_id, Object::Dictionary(dictionary));
@@ -277,14 +269,13 @@ fn main() {
     document.adjust_zero_pages();
 
     //Set all bookmarks to the PDF Object tree then set the Outlines to the Bookmark content map.
-    if let Some(outline_id) = document.build_outline() {
-        if let Ok(Object::Dictionary(dict)) = document.get_object_mut(catalog_id) {
-            dict.set("Outlines", Object::Reference(outline_id));
-        }
+    if let Some(outline_id) = document.build_outline()
+        && let Ok(Object::Dictionary(dict)) = document.get_object_mut(catalog_id)
+    {
+        dict.set("Outlines", Object::Reference(outline_id));
     }
 
-    // Most of the time this does nothing unless there are a lot of streams
-    // Can be disabled to speed up the process.
+    // Usually a no-op unless there are many streams; disabling it speeds things up.
     // document.compress();
 
     // Save the merged PDF

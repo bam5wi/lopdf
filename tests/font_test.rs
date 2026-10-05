@@ -1,7 +1,8 @@
+#[cfg(feature = "font_embedding")]
 #[test]
 fn test_font_data_creation() {
     // Load a sample TTF font file from the test resources
-    let font_file = std::fs::read("./tests/resources/fonts/Montserrat-Regular.ttf");
+    let font_file = std::fs::read("./assets/fonts/Montserrat-Regular.ttf");
 
     // Ensure the font file was read successfully
     assert!(font_file.is_ok(), "Failed to read font file");

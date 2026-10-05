@@ -1,6 +1,6 @@
 [package]
 name = "lopdf"
-version = "0.38.1"
+version = "0.45.1"
 authors = [
     "Junfeng Liu <china.liujunfeng@gmail.com>",
     "Emulator <emulator@hotmail.it>",
@@ -15,57 +15,65 @@ keywords = ["pdf", "editing", "manipulation", "merge"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/J-F-Liu/lopdf.git"
-rust-version = "1.85"
+rust-version = "1.88"
+exclude = ["/benches", "/assets", "/.chglog", "/.vscode", "/.github"]
 
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
-aes = "0.8"
-bitflags = "2.11"
-cbc = "0.1.2"
+aes = "0.9"
+bitflags = "2.13"
+brotli-decompressor = "5.0"
+cbc = "0.2"
 chrono = { version = "0.4", optional = true, default-features = false, features = [
     "std",
-    "clock",
 ] }
-ecb = "0.1"
+ecb = "0.2"
 encoding_rs = "0.8"
 flate2 = "1.1"
-image = { version = "0.25.10", optional = true }
-indexmap = "2.2"
+image = { version = "0.25", optional = true }
+indexmap = "2.14"
 itoa = "1.0"
 jiff = { version = "0.2", optional = true }
 getrandom = "0.4"
 log = "0.4"
-md-5 = "0.10"
+md-5 = "0.11"
 nom = "8.0"
-nom_locate = "5.0"
 rand = { version = "0.10" }
-rangemap = "1.6"
-rayon = { version = "1.10", optional = true }
+rangemap = "1.7"
+rayon = { version = "1.12", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
-sha2 = "0.10"
-stringprep = "0.1"
+sha2 = "0.11"
+stringprep = "0.1.5"
 thiserror = "2.0"
-time = { version = "0.3.47", features = [
+time = { version = "0.3", features = [
     "formatting",
     "parsing",
 ], optional = true }
 tokio = { version = "1", features = ["fs", "io-util"], optional = true }
-weezl = "0.1"
-ttf-parser = "0.25"
+weezl = "0.2"
+skrifa = { version = "0.45.1", optional = true }
 
 [dev-dependencies]
 clap = { version = "4.6", features = ["derive"] }
 env_logger = "0.11"
+flate2 = "1.1"
 serde_json = "1.0"
 shellexpand = "3.1"
-tempfile = "3.20"
+tempfile = "3.27"
 wasm-bindgen-test = "0.3"
+
+[target.'cfg(not(target_family="wasm"))'.dev-dependencies]
+criterion = "0.8"
 
 [features]
 async = ["tokio/rt-multi-thread", "tokio/macros"]
+# Fixed-offset and UTC conversions, which is all a PDF date can express.
 chrono = ["dep:chrono"]
-default = ["chrono", "jiff", "rayon", "time"]
+# The system-local conversions, and the iana-time-zone subtree they need.
+chrono-clock = ["chrono", "chrono/clock"]
+default = ["chrono-clock", "rayon"]
 embed_image = ["image"]
+font_embedding = ["dep:skrifa"]
 jiff = ["dep:jiff"]
 wasm_js = ["getrandom/wasm_js"]
 serde = ["dep:serde"]
@@ -82,10 +90,21 @@ required-features = ["serde"]
 
 [[example]]
 name = "print_annotations"
-required-features = ["default"]
+# No `required-features`: the example uses `env_logger` (a dev-dependency,
+# always available to an example) and `Document`/`Object`, none of which is
+# behind a feature. Naming `default` only made it silently unbuildable under
+# `--no-default-features`.
 
 [[example]]
 name = "rotate"
+
+[[bench]]
+name = "datetime"
+harness = false
+
+[[bench]]
+name = "parse"
+harness = false
 
 [badges]
 travis-ci = { repository = "J-F-Liu/lopdf" }

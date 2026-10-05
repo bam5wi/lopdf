@@ -1,5 +1,6 @@
 use lopdf::encryption::crypt_filters::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
 use lopdf::{Document, EncryptionState, EncryptionVersion, Permissions};
+use rand::RngExt as _;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -83,8 +84,6 @@ fn main() {
             }
         }
         5 => {
-            use rand::RngExt;
-
             assert!(
                 args.len() >= 6,
                 "Not enough arguments: input_file output_file 1 owner_password user_password"

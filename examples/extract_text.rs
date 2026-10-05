@@ -9,8 +9,6 @@ use clap::Parser;
 use lopdf::{Document, LoadOptions, Object};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
-use serde_json;
-use shellexpand;
 
 #[cfg(feature = "async")]
 use tokio::runtime::Builder;
@@ -98,17 +96,16 @@ fn filter_func(object_id: (u32, u16), object: &mut Object) -> Option<((u32, u16)
 
 #[cfg(not(feature = "async"))]
 fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
-    Document::load_with_options(path, LoadOptions::with_filter(filter_func))
-        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
+    Document::load_with_options(path, LoadOptions::with_filter(filter_func)).map_err(|e| Error::other(e.to_string()))
 }
 
 #[cfg(feature = "async")]
 fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
-    Ok(Builder::new_current_thread().build().unwrap().block_on(async move {
+    Builder::new_current_thread().build().unwrap().block_on(async move {
         Document::load_with_options(path, LoadOptions::with_filter(filter_func))
             .await
-            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
-    })?)
+            .map_err(|e| Error::other(e.to_string()))
+    })
 }
 
 fn get_pdf_text(doc: &Document) -> Result<PdfText, Error> {
@@ -122,10 +119,9 @@ fn get_pdf_text(doc: &Document) -> Result<PdfText, Error> {
         .map(
             |(page_num, page_id): (u32, (u32, u16))| -> Result<(u32, Vec<String>), Error> {
                 let text = doc.extract_text(&[page_num]).map_err(|e| {
-                    Error::new(
-                        ErrorKind::Other,
-                        format!("Failed to extract text from page {page_num} id={page_id:?}: {e:}"),
-                    )
+                    Error::other(format!(
+                        "Failed to extract text from page {page_num} id={page_id:?}: {e:}"
+                    ))
                 })?;
                 Ok((
                     page_num,

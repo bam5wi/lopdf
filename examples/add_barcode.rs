@@ -76,11 +76,10 @@ fn load_pdf<P: AsRef<Path>>(path: P, stop: Arc<AtomicBool>) -> Result<Document, 
 
 #[cfg(feature = "async")]
 fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
-    Ok(Builder::new_current_thread().build().unwrap().block_on(async move {
-        Document::load(path)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
-    })?)
+    Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async move { Document::load(path).await.map_err(|e| Error::other(e.to_string())) })
 }
 
 #[allow(non_upper_case_globals)]

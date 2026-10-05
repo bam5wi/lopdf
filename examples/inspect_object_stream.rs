@@ -32,16 +32,14 @@ fn main() {
                 println!("Dictionary: {:?}", stream.dict);
 
                 // Try to parse it
-                let mut stream_clone = stream.clone();
-                match ObjectStream::new(&mut stream_clone) {
+                match ObjectStream::new(stream) {
                     Ok(obj_stream) => {
                         println!("\nSuccessfully parsed object stream!");
                         println!("Contains {} objects", obj_stream.objects.len());
 
                         // List first 20 objects
                         println!("\nFirst 20 objects in stream:");
-                        let mut count = 0;
-                        for ((id, generation), obj) in &obj_stream.objects {
+                        for (count, ((id, generation), obj)) in obj_stream.objects.iter().enumerate() {
                             if count >= 20 {
                                 break;
                             }
@@ -52,22 +50,17 @@ fn main() {
                                 let key_count = dict.len();
                                 println!("    Dictionary with {} keys", key_count);
                             }
-                            count += 1;
                         }
 
                         // Check if any page-related objects are in there
                         println!("\nChecking for page-related objects:");
                         for ((id, generation), obj) in &obj_stream.objects {
                             if let Object::Dictionary(dict) = obj {
-                                if let Ok(type_obj) = dict.get(b"Type") {
-                                    if let Ok(type_name) = type_obj.as_name() {
-                                        if type_name == b"Page" {
-                                            println!(
-                                                "  WARNING: Page object {} {} R is in object stream!",
-                                                id, generation
-                                            );
-                                        }
-                                    }
+                                if let Ok(type_obj) = dict.get(b"Type")
+                                    && let Ok(type_name) = type_obj.as_name()
+                                    && type_name == b"Page"
+                                {
+                                    println!("  WARNING: Page object {} {} R is in object stream!", id, generation);
                                 }
 
                                 // Check for font descriptors
@@ -89,19 +82,18 @@ fn main() {
             println!("\n\nChecking critical object locations:");
 
             // Check catalog
-            if let Ok(root_ref) = doc.trailer.get(b"Root") {
-                if let Object::Reference(root_id) = root_ref {
-                    check_object_status(&doc, *root_id, "Catalog (Root)");
-                }
+            if let Ok(root_ref) = doc.trailer.get(b"Root")
+                && let Object::Reference(root_id) = root_ref
+            {
+                check_object_status(&doc, *root_id, "Catalog (Root)");
             }
 
             // Check pages tree
-            if let Ok(catalog) = doc.catalog() {
-                if let Ok(pages_ref) = catalog.get(b"Pages") {
-                    if let Object::Reference(pages_id) = pages_ref {
-                        check_object_status(&doc, *pages_id, "Pages tree root");
-                    }
-                }
+            if let Ok(catalog) = doc.catalog()
+                && let Ok(pages_ref) = catalog.get(b"Pages")
+                && let Object::Reference(pages_id) = pages_ref
+            {
+                check_object_status(&doc, *pages_id, "Pages tree root");
             }
 
             // Check specific page objects

@@ -33,10 +33,19 @@ impl Document {
     pub fn get_named_destinations(
         &self, tree: &Dictionary, named_destinations: &mut IndexMap<Vec<u8>, Destination>,
     ) -> Result<()> {
+        self.get_named_destinations_impl(tree, named_destinations, 0)
+    }
+
+    fn get_named_destinations_impl(
+        &self, tree: &Dictionary, named_destinations: &mut IndexMap<Vec<u8>, Destination>, depth: usize,
+    ) -> Result<()> {
+        if depth >= crate::reader::MAX_NESTING_DEPTH {
+            return Err(crate::Error::RecursionLimit);
+        }
         if let Ok(kids) = tree.get(b"Kids") {
             for kid in kids.as_array()? {
                 if let Ok(kid) = kid.as_reference().and_then(move |id| self.get_dictionary(id)) {
-                    self.get_named_destinations(kid, named_destinations)?;
+                    self.get_named_destinations_impl(kid, named_destinations, depth + 1)?;
                 }
             }
         }
@@ -55,15 +64,15 @@ impl Document {
                     if let Ok(dict) = self.get_dictionary(obj_ref) {
                         let val = dict.get(b"D").as_ref().unwrap().as_array()?;
                         let dest = Destination::new(key.unwrap().clone(), val[0].clone(), val[1].clone());
-                        named_destinations.insert(key.unwrap().as_str()?.to_vec(), dest);
+                        named_destinations.insert(key.unwrap().as_str().unwrap().to_vec(), dest);
                     } else if let Ok(Object::Array(val)) = self.get_object(obj_ref) {
                         let dest = Destination::new(key.unwrap().clone(), val[0].clone(), val[1].clone());
-                        named_destinations.insert(key.unwrap().as_str()?.to_vec(), dest);
+                        named_destinations.insert(key.unwrap().as_str().unwrap().to_vec(), dest);
                     }
                 } else if let Ok(dict) = val.unwrap().as_dict() {
                     let val = dict.get(b"D").as_ref().unwrap().as_array()?;
                     let dest = Destination::new(key.unwrap().clone(), val[0].clone(), val[1].clone());
-                    named_destinations.insert(key.unwrap().as_str()?.to_vec(), dest);
+                    named_destinations.insert(key.unwrap().as_str().unwrap().to_vec(), dest);
                 } else {
                     // TODO: Log error: Unpexpected node type
                 }

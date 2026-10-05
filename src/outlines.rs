@@ -1,7 +1,8 @@
 use indexmap::IndexMap;
 
-use super::{Destination, Dictionary, Document, Error, Object, Result};
+use super::{Destination, Dictionary, Document, Error, Object, ObjectId, Result};
 
+#[derive(Debug, Clone)]
 pub enum Outline {
     Destination(Destination),
     SubOutlines(Vec<Outline>),
@@ -33,9 +34,19 @@ impl Document {
     }
 
     pub fn get_outlines(
-        &self, mut node: Option<Object>, mut outlines: Option<Vec<Outline>>,
+        &self, node: Option<Object>, outlines: Option<Vec<Outline>>,
         named_destinations: &mut IndexMap<Vec<u8>, Destination>,
     ) -> Result<Option<Vec<Outline>>> {
+        self.get_outlines_impl(node, outlines, named_destinations, 0)
+    }
+
+    fn get_outlines_impl(
+        &self, mut node: Option<Object>, mut outlines: Option<Vec<Outline>>,
+        named_destinations: &mut IndexMap<Vec<u8>, Destination>, depth: usize,
+    ) -> Result<Option<Vec<Outline>>> {
+        if depth >= crate::reader::MAX_NESTING_DEPTH {
+            return Err(Error::RecursionLimit);
+        }
         if outlines.is_none() {
             outlines = Some(Vec::new());
             let catalog = self.catalog()?;
@@ -68,20 +79,20 @@ impl Document {
             Err(_) => self.get_object(node.as_reference()?)?.as_dict()?,
         };
         loop {
-            if let Ok(Some(outline)) = self.get_outline(node, named_destinations) {
-                if let Some(ref mut outlines) = outlines {
-                    outlines.push(outline);
-                }
+            if let Ok(Some(outline)) = self.get_outline(node, named_destinations)
+                && let Some(ref mut outlines) = outlines
+            {
+                outlines.push(outline);
             }
             if let Ok(first) = node.get(b"First") {
                 let sub_outlines = Vec::new();
-                let sub_outlines = self.get_outlines(Some(first.clone()), Some(sub_outlines), named_destinations)?;
-                if let Some(sub_outlines) = sub_outlines {
-                    if !sub_outlines.is_empty() {
-                        if let Some(ref mut outlines) = outlines {
-                            outlines.push(Outline::SubOutlines(sub_outlines));
-                        }
-                    }
+                let sub_outlines =
+                    self.get_outlines_impl(Some(first.clone()), Some(sub_outlines), named_destinations, depth + 1)?;
+                if let Some(sub_outlines) = sub_outlines
+                    && !sub_outlines.is_empty()
+                    && let Some(ref mut outlines) = outlines
+                {
+                    outlines.push(Outline::SubOutlines(sub_outlines));
                 }
             }
             node = match self.get_dict_in_dict(node, b"Next") {
@@ -90,6 +101,23 @@ impl Document {
             };
         }
         Ok(outlines)
+    }
+
+    pub fn delete_outlines(&mut self) -> Result<()> {
+        if let Some(outlines_id) = self
+            .catalog()?
+            .get(b"Outlines")
+            .ok()
+            .and_then(|v| v.as_reference().ok())
+        {
+            let outlines = self.get_dictionary(outlines_id)?;
+            if let Ok(Object::Reference(first)) = outlines.get(b"First") {
+                self.walk_outlines_del(*first, 0)?;
+            }
+            self.delete_object(outlines_id);
+        }
+
+        Ok(())
     }
 
     fn build_outline_result(
@@ -115,5 +143,26 @@ impl Document {
             _ => return Err(Error::InvalidOutline(format!("Unexpected destination {dest:?}"))),
         };
         Ok(Some(outline))
+    }
+
+    fn walk_outlines_del(&mut self, outline: ObjectId, depth: usize) -> Result<()> {
+        if depth >= crate::reader::MAX_NESTING_DEPTH {
+            return Err(Error::RecursionLimit);
+        }
+        let mut cur = Some(outline);
+
+        while let Some(id) = cur.take() {
+            let outline = self.get_dictionary(id)?;
+            let first = outline.get(b"First").ok().and_then(|v| v.as_reference().ok());
+            let next = outline.get(b"Next").ok().and_then(|v| v.as_reference().ok());
+
+            if let Some(first) = first {
+                self.walk_outlines_del(first, depth + 1)?;
+            }
+            cur = next;
+            self.delete_object(id);
+        }
+
+        Ok(())
     }
 }

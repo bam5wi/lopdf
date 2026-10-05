@@ -1,14 +1,16 @@
 use thiserror::Error;
 
 use crate::encodings::cmap::UnicodeCMapError;
-use crate::{encryption, ObjectId};
+use crate::{ObjectId, encryption};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Error)]
 pub enum Error {
     /// Lopdf does not (yet) implement a needed feature.
-    #[error("missing feature of lopdf: {0}; please open an issue at https://github.com/J-F-Liu/lopdf/ to let the developers know of your usecase")]
+    #[error(
+        "missing feature of lopdf: {0}; please open an issue at https://github.com/J-F-Liu/lopdf/ to let the developers know of your usecase"
+    )]
     Unimplemented(&'static str),
 
     /// An Object has the wrong type, e.g. the Object is an Array where a Name would be expected.
@@ -26,13 +28,13 @@ pub enum Error {
     #[error("invalid character encoding")]
     CharacterEncoding,
     /// The stream couldn't be decompressed.
-    #[error("couldn't decompress stream {0}")]
+    #[error("couldn't decompress stream")]
     Decompress(#[from] DecompressError),
     /// Failed to parse input.
-    #[error("couldn't parse input: {0}")]
+    #[error("couldn't parse input")]
     Parse(#[from] ParseError),
     /// Error when decrypting the contents of the file
-    #[error("decryption error: {0}")]
+    #[error("decryption error")]
     Decryption(#[from] encryption::DecryptionError),
     /// Dictionary key was not found.
     #[error("missing required dictionary key \"{0}\"")]
@@ -53,7 +55,7 @@ pub enum Error {
     #[error("invalid byte offset")]
     InvalidOffset(usize),
     /// IO error
-    #[error("IO error: {0}")]
+    #[error("IO error")]
     IO(#[from] std::io::Error),
     // TODO: Maybe remove, as outline is not required in spec.
     /// PDF document has no outline.
@@ -84,12 +86,17 @@ pub enum Error {
     /// This might indicate a reference loop.
     #[error("dereferencing object reached limit, may indicate a reference cycle")]
     ReferenceLimit,
+    /// Traversal of the document's object graph (e.g. a `/Kids`, `/First`, or `/Parent` chain)
+    /// exceeded the supported nesting depth.
+    /// This might indicate a reference cycle or a maliciously deep structure.
+    #[error("object graph traversal reached the nesting-depth limit, may indicate a reference cycle")]
+    RecursionLimit,
     /// Decoding text string failed.
     #[error("decoding text string failed")]
     TextStringDecode,
     /// Error while parsing cross reference table.
-    #[error("failed parsing cross reference table: {0}")]
-    Xref(XrefError),
+    #[error("failed parsing cross reference table")]
+    Xref(#[from] XrefError),
     /// Invalid indirect object while parsing at offset.
     #[error("invalid indirect object at byte offset {offset}")]
     IndirectObject { offset: usize },
@@ -98,25 +105,41 @@ pub enum Error {
     ObjectIdMismatch,
     /// Error when handling images.
     #[cfg(feature = "embed_image")]
-    #[error("image error: {0}")]
+    #[error("image error")]
     Image(#[from] image::ImageError),
     /// Syntax error while processing the content stream.
     #[error("syntax error in content stream: {0}")]
     Syntax(String),
     /// Could not parse ToUnicodeCMap.
-    #[error("failed parsing ToUnicode CMap: {0}")]
+    #[error("failed parsing ToUnicode CMap")]
     ToUnicodeCMap(#[from] UnicodeCMapError),
-    #[error("converting integer: {0}")]
+    #[error("converting integer")]
     TryFromInt(#[from] std::num::TryFromIntError),
     /// Encountered an unsupported security handler.
     #[error("unsupported security handler")]
     UnsupportedSecurityHandler(Vec<u8>),
+    /// Encountered when a differences code is out of bounds.
+    #[error("invalid encoding difference code: {code}")]
+    InvalidEncodingDifferenceCode { code: i64 },
+    /// Encountered when a differences glyph name is invalid.
+    #[error("invalid encoding difference glyph name: {name}")]
+    InvalidEncodingDifferenceGlyph { name: String },
 }
 
 #[derive(Error, Debug)]
 pub enum DecompressError {
     #[error("decoding ASCII85 failed: {0}")]
     Ascii85(&'static str),
+    #[error("decoding ASCIIHex failed: {0}")]
+    AsciiHex(&'static str),
+    #[error("applying the stream predictor failed: {0}")]
+    Predictor(&'static str),
+    /// The decompressed output exceeded the allowed size limit. This guards
+    /// against decompression bombs: a small compressed stream that inflates to
+    /// an enormous size (potentially exhausting memory). The `limit` is the
+    /// maximum number of output bytes that were permitted.
+    #[error("decompressed output exceeded the {limit}-byte limit (possible decompression bomb)")]
+    MemoryLimitExceeded { limit: usize },
 }
 
 #[derive(Error, Debug)]

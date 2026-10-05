@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, atomic::AtomicBool};
 
 use lopdf::{Document, Object, ObjectId};
-
 #[cfg(feature = "async")]
 use tokio::runtime::Builder;
 
@@ -38,14 +37,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Build reverse mapping
         for ref_id in refs {
-            referenced_by.entry(ref_id).or_insert_with(HashSet::new).insert(id);
+            referenced_by.entry(ref_id).or_default().insert(id);
         }
     }
 
     // Also check trailer references
     let trailer_refs = collect_references_from_dict(&doc.trailer);
     for ref_id in &trailer_refs {
-        referenced_by.entry(*ref_id).or_insert_with(HashSet::new).insert((0, 0));
+        referenced_by.entry(*ref_id).or_default().insert((0, 0));
     }
 
     // Analyze specific problematic objects

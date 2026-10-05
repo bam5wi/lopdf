@@ -4,13 +4,22 @@ use crate::encryption::crypt_filters::*;
 use crate::encryption::{self, EncryptionState, PasswordAlgorithm};
 use crate::xobject::PdfImage;
 use crate::xref::{Xref, XrefType};
-use crate::{Error, ObjectStream, Result, Stream};
+use crate::{DecompressError, Error, ObjectStream, Result, Stream};
 use log::debug;
 use std::cmp::max;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
 use std::str;
 use std::sync::Arc;
+
+/// Which credential a caller-supplied password is checked against.
+#[derive(Clone, Copy)]
+enum PasswordRole {
+    Owner,
+    User,
+    /// Either will do: the two are independent credentials and the file
+    /// encryption key is then resolved from whichever matched.
+    Either,
+}
 
 /// A PDF document.
 ///
@@ -61,33 +70,37 @@ pub struct Document {
 impl Document {
     /// Create new PDF document.
     pub fn new() -> Self {
-        Self {
-            version: "1.4".to_string(),
-            binary_mark: vec![0xBB, 0xAD, 0xC0, 0xDE],
-            trailer: Dictionary::new(),
-            reference_table: Xref::new(0, XrefType::CrossReferenceStream),
-            objects: BTreeMap::new(),
-            max_id: 0,
-            max_bookmark_id: 0,
-            bookmarks: Vec::new(),
-            bookmark_table: HashMap::new(),
-            xref_start: 0,
-            encryption_state: None,
-        }
+        Self::with_baseline(Dictionary::new(), XrefType::CrossReferenceStream, 0, 0)
     }
 
     /// Create a new PDF document that is an incremental update to a previous document.
     pub fn new_from_prev(prev: &Document) -> Self {
         let mut new_trailer = prev.trailer.clone();
-        new_trailer.set("Prev", Object::Integer(prev.xref_start as i64));
+        // A zero xref_start marks a document with no known on-disk table
+        // (e.g. recovered by scanning); emitting `/Prev 0` would corrupt the chain.
+        if prev.xref_start != 0 {
+            new_trailer.set("Prev", Object::Integer(prev.xref_start as i64));
+        }
+        Self::with_baseline(
+            new_trailer,
+            prev.reference_table.cross_reference_type,
+            prev.max_id,
+            prev.max_bookmark_id,
+        )
+    }
+
+    /// The state a freshly started document shares, whether it begins from
+    /// nothing or as an incremental update of a previous one. Only the
+    /// trailer, the cross-reference type and the two id ceilings carry over.
+    fn with_baseline(trailer: Dictionary, cross_reference_type: XrefType, max_id: u32, max_bookmark_id: u32) -> Self {
         Self {
             version: "1.4".to_string(),
             binary_mark: vec![0xBB, 0xAD, 0xC0, 0xDE],
-            trailer: new_trailer,
-            reference_table: Xref::new(0, prev.reference_table.cross_reference_type),
+            trailer,
+            reference_table: Xref::new(0, cross_reference_type),
             objects: BTreeMap::new(),
-            max_id: prev.max_id,
-            max_bookmark_id: prev.max_bookmark_id,
+            max_id,
+            max_bookmark_id,
             bookmarks: Vec::new(),
             bookmark_table: HashMap::new(),
             xref_start: 0,
@@ -235,10 +248,8 @@ impl Document {
                 Object::Array(array) => traverse_array(array, action, refs),
                 Object::Dictionary(dict) => traverse_dictionary(dict, action, refs),
                 Object::Stream(stream) => traverse_dictionary(&mut stream.dict, action, refs),
-                Object::Reference(id) => {
-                    if !refs.contains(id) {
-                        refs.push(*id);
-                    }
+                Object::Reference(id) if !refs.contains(id) => {
+                    refs.push(*id);
                 }
                 _ => {}
             }
@@ -273,20 +284,35 @@ impl Document {
         self.encryption_state.is_some()
     }
 
+    /// The security handler for this document, or [`Error::NotEncrypted`] if
+    /// the trailer carries no `/Encrypt` entry.
+    fn password_algorithm(&self) -> Result<PasswordAlgorithm> {
+        if !self.is_encrypted() {
+            return Err(Error::NotEncrypted);
+        }
+
+        PasswordAlgorithm::try_from(self)
+    }
+
+    /// Run the owner and/or user check against an already-prepared password.
+    fn authenticate_with(&self, algorithm: &PasswordAlgorithm, password: &[u8], role: PasswordRole) -> Result<()> {
+        match role {
+            PasswordRole::Owner => algorithm.authenticate_owner_password(self, password)?,
+            PasswordRole::User => algorithm.authenticate_user_password(self, password)?,
+            PasswordRole::Either => algorithm
+                .authenticate_owner_password(self, password)
+                .or(algorithm.authenticate_user_password(self, password))?,
+        }
+
+        Ok(())
+    }
+
     /// Authenticate the provided owner password directly as bytes without sanitization
     pub fn authenticate_raw_owner_password<P>(&self, password: P) -> Result<()>
     where
         P: AsRef<[u8]>,
     {
-        if !self.is_encrypted() {
-            return Err(Error::NotEncrypted);
-        }
-
-        let password = password.as_ref();
-        let algorithm = PasswordAlgorithm::try_from(self)?;
-        algorithm.authenticate_owner_password(self, password)?;
-
-        Ok(())
+        self.authenticate_with(&self.password_algorithm()?, password.as_ref(), PasswordRole::Owner)
     }
 
     /// Authenticate the provided user password directly as bytes without sanitization
@@ -294,15 +320,7 @@ impl Document {
     where
         P: AsRef<[u8]>,
     {
-        if !self.is_encrypted() {
-            return Err(Error::NotEncrypted);
-        }
-
-        let password = password.as_ref();
-        let algorithm = PasswordAlgorithm::try_from(self)?;
-        algorithm.authenticate_user_password(self, password)?;
-
-        Ok(())
+        self.authenticate_with(&self.password_algorithm()?, password.as_ref(), PasswordRole::User)
     }
 
     /// Authenticate the provided owner/user password as bytes without sanitization
@@ -310,58 +328,30 @@ impl Document {
     where
         P: AsRef<[u8]>,
     {
-        if !self.is_encrypted() {
-            return Err(Error::NotEncrypted);
-        }
-
-        let password = password.as_ref();
-        let algorithm = PasswordAlgorithm::try_from(self)?;
-        algorithm
-            .authenticate_owner_password(self, password)
-            .or(algorithm.authenticate_user_password(self, password))?;
-
-        Ok(())
+        self.authenticate_with(&self.password_algorithm()?, password.as_ref(), PasswordRole::Either)
     }
 
     /// Authenticate the provided owner password
     pub fn authenticate_owner_password(&self, password: &str) -> Result<()> {
-        if !self.is_encrypted() {
-            return Err(Error::NotEncrypted);
-        }
-
-        let algorithm = PasswordAlgorithm::try_from(self)?;
-        let password = algorithm.sanitize_password(password)?;
-        algorithm.authenticate_owner_password(self, &password)?;
-
-        Ok(())
+        self.authenticate_sanitized(password, PasswordRole::Owner)
     }
 
     /// Authenticate the provided user password
     pub fn authenticate_user_password(&self, password: &str) -> Result<()> {
-        if !self.is_encrypted() {
-            return Err(Error::NotEncrypted);
-        }
-
-        let algorithm = PasswordAlgorithm::try_from(self)?;
-        let password = algorithm.sanitize_password(password)?;
-        algorithm.authenticate_user_password(self, &password)?;
-
-        Ok(())
+        self.authenticate_sanitized(password, PasswordRole::User)
     }
 
     /// Authenticate the provided owner/user password
     pub fn authenticate_password(&self, password: &str) -> Result<()> {
-        if !self.is_encrypted() {
-            return Err(Error::NotEncrypted);
-        }
+        self.authenticate_sanitized(password, PasswordRole::Either)
+    }
 
-        let algorithm = PasswordAlgorithm::try_from(self)?;
+    /// Normalize `password` for this document's revision, then check it.
+    fn authenticate_sanitized(&self, password: &str, role: PasswordRole) -> Result<()> {
+        let algorithm = self.password_algorithm()?;
         let password = algorithm.sanitize_password(password)?;
-        algorithm
-            .authenticate_owner_password(self, &password)
-            .or(algorithm.authenticate_user_password(self, &password))?;
 
-        Ok(())
+        self.authenticate_with(&algorithm, &password, role)
     }
 
     /// Returns a `BTreeMap` of the crypt filters available in the PDF document if any.
@@ -386,23 +376,13 @@ impl Document {
                 let cfm = filter.get(b"CFM").and_then(|object| object.as_name()).ok();
 
                 let crypt_filter: Arc<dyn CryptFilter> = match cfm {
-                    // The application shall ask the security handler for the file encryption key
-                    // and shall implicitly decrypt data using the RC4 algorithm.
+                    // RC4.
                     Some(b"V2") => Arc::new(Rc4CryptFilter),
-                    // The application shall ask the security handler for the file encryption key
-                    // and shall implicitly decrypt data using the AES-128 algorithm in Cipher
-                    // Block Chaining (CBC) mode with a 16-byte block size and an initialization
-                    // vector that shall be randomly generated and placed as the first 16 bytes in
-                    // the stream or string. The key size (Length) shall be 128 bits.
+                    // AES-128 in CBC mode: 16-byte block, random IV prefixed to the data, 128-bit key.
                     Some(b"AESV2") => Arc::new(Aes128CryptFilter),
-                    // The application shall ask the security handler for the file encryption key
-                    // and shall implicitly decrypt data using the AES-256 algorithm in Cipher
-                    // Block Chaining (CBC) with padding mode with a 16-byte block size and an
-                    // initialization vector that is randomly generated and placed as the first 16
-                    // bytes in the stream or string. The key size (Length) shall be 256 bits.
+                    // AES-256 in padded CBC mode: 16-byte block, random IV prefixed to the data, 256-bit key.
                     Some(b"AESV3") => Arc::new(Aes256CryptFilter),
-                    // The application shall not decrypt data but shall direct the input stream to
-                    // the security handler for decryption.
+                    // No decryption here; the security handler is left to the application.
                     Some(b"Identity") | None => Arc::new(IdentityCryptFilter),
                     // Unknown crypt filter method.
                     _ => continue,
@@ -460,7 +440,7 @@ impl Document {
         // Find the ID of the encryption dict; we'll want to skip it when decrypting
         let encryption_obj_id = self.trailer.get(b"Encrypt").and_then(Object::as_reference)?;
 
-        let state = EncryptionState::decode(&*self, password)?;
+        let mut state = EncryptionState::decode(&*self, password)?;
 
         for (&id, obj) in self.objects.iter_mut() {
             // The encryption dictionary is not encrypted, leave it alone
@@ -474,8 +454,8 @@ impl Document {
         // Add the objects from the object streams now that they have been decrypted.
         let mut object_streams = vec![];
 
-        for (_, object) in self.objects.iter_mut() {
-            let Ok(ref mut stream) = object.as_stream_mut() else {
+        for object in self.objects.values() {
+            let Ok(stream) = object.as_stream() else {
                 continue;
             };
 
@@ -499,6 +479,11 @@ impl Document {
 
         let object_id = self.trailer.remove(b"Encrypt").unwrap().as_reference()?;
         self.objects.remove(&object_id);
+
+        // Remember the original /Encrypt id so an incremental save can point the appended
+        // trailer at the still-intact dictionary in the previous revision.
+        // See `IncrementalDocument::save_internal`.
+        state.encrypt_object_id = Some(object_id);
 
         self.encryption_state = Some(state);
 
@@ -588,16 +573,70 @@ impl Document {
     }
 
     /// Get content of a page.
-    pub fn get_page_content(&self, page_id: ObjectId) -> Result<Vec<u8>> {
-        let mut content = Vec::new();
-        let content_streams = self.get_page_contents(page_id);
-        for object_id in content_streams {
-            if let Ok(content_stream) = self.get_object(object_id).and_then(Object::as_stream) {
-                match content_stream.decompressed_content() {
-                    Ok(data) => content.write_all(&data)?,
-                    Err(_) => content.write_all(&content_stream.content)?,
-                };
+    pub fn get_page_content(&self, page_id: ObjectId) -> Vec<u8> {
+        // With no limit there is nothing to exceed, so the unlimited path cannot
+        // fail today; the fallback just keeps a future error from panicking.
+        self.page_content(page_id, None).unwrap_or_default()
+    }
+
+    /// Get the content of a page, bounding the total decompressed output to
+    /// `max_decompressed_size` bytes.
+    ///
+    /// This is the decompression-bomb-safe counterpart to
+    /// [`Document::get_page_content`]. A page's content can be split across
+    /// several streams; the whole concatenated result is bounded to roughly
+    /// `max_decompressed_size` bytes (each stream is decoded against the
+    /// *remaining* budget, so N streams cannot sum to N times the limit), which
+    /// stops a small compressed page stream from inflating without limit when
+    /// processing untrusted PDFs. Use it (and
+    /// [`Document::extract_text_with_limit`]) instead of the unbounded variants
+    /// for input you do not control.
+    ///
+    /// Returns [`DecompressError::MemoryLimitExceeded`](crate::DecompressError::MemoryLimitExceeded)
+    /// if the page content would exceed the limit. Like
+    /// [`Document::get_page_content`], a stream that fails to decode for a reason
+    /// *other* than the size limit falls back to its raw bytes, but that fallback
+    /// is also kept within the remaining budget.
+    pub fn get_page_content_with_limit(&self, page_id: ObjectId, max_decompressed_size: usize) -> Result<Vec<u8>> {
+        self.page_content(page_id, Some(max_decompressed_size))
+    }
+
+    /// Shared implementation of [`Document::get_page_content`] and its bounded
+    /// counterpart: concatenate the page's content streams, newline-separated.
+    ///
+    /// A stream that fails to decode falls back to its raw bytes; under a limit,
+    /// the fallback is itself charged against the remaining budget, and a stream
+    /// that would exceed the limit is rejected rather than truncated.
+    fn page_content(&self, page_id: ObjectId, max_decompressed_size: Option<usize>) -> Result<Vec<u8>> {
+        let exceeded = || {
+            DecompressError::MemoryLimitExceeded {
+                limit: max_decompressed_size.unwrap_or(0),
             }
+            .into()
+        };
+
+        let mut content = Vec::new();
+        for object_id in self.get_page_contents(page_id) {
+            let Ok(content_stream) = self.get_object(object_id).and_then(Object::as_stream) else {
+                continue;
+            };
+            let remaining = max_decompressed_size.map(|max| max.saturating_sub(content.len()));
+
+            match remaining {
+                Some(remaining) => match content_stream.decompressed_content_with_limit(remaining) {
+                    Ok(data) => content.extend_from_slice(&data),
+                    Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => return Err(exceeded()),
+                    Err(_) if content_stream.content.len() <= remaining => {
+                        content.extend_from_slice(&content_stream.content);
+                    }
+                    Err(_) => return Err(exceeded()),
+                },
+                None => match content_stream.decompressed_content() {
+                    Ok(data) => content.extend_from_slice(&data),
+                    Err(_) => content.extend_from_slice(&content_stream.content),
+                },
+            }
+            content.push(b'\n');
         }
         Ok(content)
     }
@@ -614,6 +653,9 @@ impl Document {
             if let Ok(parent_id) = page_node.get(b"Parent").and_then(Object::as_reference) {
                 if already_seen.contains(&parent_id) {
                     return Err(Error::ReferenceCycle(parent_id));
+                }
+                if already_seen.len() >= crate::reader::MAX_NESTING_DEPTH {
+                    return Err(Error::RecursionLimit);
                 }
                 already_seen.insert(parent_id);
                 let parent_dict = doc.get_dictionary(parent_id)?;
@@ -673,23 +715,127 @@ impl Document {
     /// Get the PDF annotations of a page. The /Subtype of each annotation dictionary defines the
     /// annotation type (Text, Link, Highlight, Underline, Ink, Popup, Widget, etc.). The /Rect of
     /// an annotation dictionary defines its location on the page.
+    ///
+    /// `/Annots` itself may be an array or a reference to one, and each entry of that array may be
+    /// a reference to an annotation dictionary or, equally legally, the dictionary written directly
+    /// (ISO 32000-1, 12.5.2 requires an indirect object only for an annotation that carries a
+    /// `/Popup` or is the target of an `/IRT` reply). Both forms are returned.
+    ///
+    /// An entry that is neither is skipped, as is a reference that does not resolve to a
+    /// dictionary: a damaged entry costs its own annotation rather than the whole page.
     pub fn get_page_annotations(&self, page_id: ObjectId) -> Result<Vec<&Dictionary>> {
-        let mut annotations = vec![];
-        if let Ok(page) = self.get_dictionary(page_id) {
-            match page.get(b"Annots") {
-                Ok(Object::Reference(id)) => self
-                    .get_object(*id)
-                    .and_then(Object::as_array)?
-                    .iter()
-                    .flat_map(Object::as_reference)
-                    .flat_map(|id| self.get_dictionary(id))
-                    .for_each(|a| annotations.push(a)),
-                Ok(Object::Array(a)) => a
-                    .iter()
-                    .flat_map(Object::as_reference)
-                    .flat_map(|id| self.get_dictionary(id))
-                    .for_each(|a| annotations.push(a)),
+        let (_, entries) = self.annots_container(page_id)?;
+        let mut annotations = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry {
+                Object::Reference(id) => {
+                    if let Ok(dictionary) = self.get_dictionary(*id) {
+                        annotations.push(dictionary);
+                    }
+                }
+                Object::Dictionary(dictionary) => annotations.push(dictionary),
                 _ => {}
+            }
+        }
+        Ok(annotations)
+    }
+
+    /// Resolve a page's `/Annots` to the array of annotation entries, together
+    /// with the object that array lives in: either an indirect array or, when
+    /// `/Annots` is written directly into the page, the page itself.
+    fn annots_container(&self, page_id: ObjectId) -> Result<(ObjectId, &[Object])> {
+        let Ok(page) = self.get_dictionary(page_id) else {
+            return Ok((page_id, &[]));
+        };
+        match page.get(b"Annots") {
+            Ok(Object::Reference(id)) => Ok((*id, self.get_object(*id).and_then(Object::as_array)?)),
+            Ok(Object::Array(entries)) => Ok((page_id, entries)),
+            _ => Ok((page_id, &[])),
+        }
+    }
+
+    /// Get mutable references to the PDF annotations of a page, the counterpart
+    /// to [`Document::get_page_annotations`].
+    ///
+    /// The same two entry forms are handled: a `/Annots` entry may be a
+    /// reference to an annotation dictionary or the dictionary written directly
+    /// into the array, and `/Annots` itself may be an array or a reference to
+    /// one. An entry that does not resolve to a dictionary is skipped, exactly
+    /// as in the read-only version.
+    ///
+    /// A `&mut Dictionary` cannot alias, so when the same annotation object is
+    /// referenced by more than one entry only its first occurrence is returned.
+    pub fn get_page_annotations_mut(&mut self, page_id: ObjectId) -> Result<Vec<&mut Dictionary>> {
+        enum Slot {
+            Referenced(ObjectId),
+            Inline(usize),
+        }
+
+        // Plan the work under a shared borrow; it ends here, before mutable access.
+        let (container_id, plan, referenced): (ObjectId, Vec<Slot>, HashSet<ObjectId>) = {
+            // Unlike the read-only version, a `/Annots` array that does not
+            // resolve costs the page its annotations rather than the call.
+            let Ok((container_id, entries)) = self.annots_container(page_id) else {
+                return Ok(vec![]);
+            };
+            let mut plan = Vec::with_capacity(entries.len());
+            let mut referenced = HashSet::new();
+            for (index, entry) in entries.iter().enumerate() {
+                match entry {
+                    Object::Reference(id) => {
+                        referenced.insert(*id);
+                        plan.push(Slot::Referenced(*id));
+                    }
+                    Object::Dictionary(_) => plan.push(Slot::Inline(index)),
+                    _ => {}
+                }
+            }
+            (container_id, plan, referenced)
+        };
+
+        // Gather every mutable reference in one pass. Inline dictionaries all live in the one
+        // container object, so it is kept aside.
+        let need_container = plan.iter().any(|slot| matches!(slot, Slot::Inline(_)));
+        let mut container_obj: Option<&mut Object> = None;
+        let mut referenced_objs: HashMap<ObjectId, &mut Object> = HashMap::new();
+        for (&id, object) in self.objects.iter_mut() {
+            if need_container && id == container_id {
+                container_obj = Some(object);
+            } else if referenced.contains(&id) {
+                referenced_objs.insert(id, object);
+            }
+        }
+
+        let mut inline: HashMap<usize, &mut Dictionary> = HashMap::new();
+        if let Some(object) = container_obj {
+            let entries = if container_id == page_id {
+                object
+                    .as_dict_mut()?
+                    .get_mut(b"Annots")
+                    .and_then(Object::as_array_mut)?
+            } else {
+                object.as_array_mut()?
+            };
+            for (index, entry) in entries.iter_mut().enumerate() {
+                if let Object::Dictionary(dictionary) = entry {
+                    inline.insert(index, dictionary);
+                }
+            }
+        }
+
+        let mut annotations = Vec::with_capacity(plan.len());
+        for slot in plan {
+            match slot {
+                Slot::Referenced(id) => {
+                    if let Some(dictionary) = referenced_objs.remove(&id).and_then(|object| object.as_dict_mut().ok()) {
+                        annotations.push(dictionary);
+                    }
+                }
+                Slot::Inline(index) => {
+                    if let Some(dictionary) = inline.remove(&index) {
+                        annotations.push(dictionary);
+                    }
+                }
             }
         }
         Ok(annotations)
@@ -720,7 +866,10 @@ impl Document {
                 let height = dict.get(b"Height")?.as_i64()?;
                 let color_space = match dict.get(b"ColorSpace") {
                     Ok(cs) => match cs {
-                        Object::Array(array) => Some(String::from_utf8_lossy(array[0].as_name()?).to_string()),
+                        Object::Array(array) => match array.first() {
+                            Some(first) => Some(String::from_utf8_lossy(first.as_name()?).to_string()),
+                            None => None,
+                        },
                         Object::Name(name) => Some(String::from_utf8_lossy(name).to_string()),
                         _ => None,
                     },
@@ -831,23 +980,22 @@ impl Iterator for PageTreeIter<'_> {
 
                 self.kids = Some(new_kids);
 
-                if let Ok(kid_id) = kid.as_reference() {
-                    if let Ok(type_name) = self.doc.get_dictionary(kid_id).and_then(Dictionary::get_type) {
-                        match type_name {
-                            b"Page" => {
-                                return Some(kid_id);
-                            }
-                            b"Pages" => {
-                                if self.stack.len() < Self::PAGE_TREE_DEPTH_LIMIT {
-                                    let kids = self.kids.unwrap();
-                                    if !kids.is_empty() {
-                                        self.stack.push(kids);
-                                    }
-                                    self.kids = Self::kids(self.doc, kid_id);
-                                }
-                            }
-                            _ => {}
+                if let Ok(kid_id) = kid.as_reference()
+                    && let Ok(type_name) = self.doc.get_dictionary(kid_id).and_then(Dictionary::get_type)
+                {
+                    match type_name {
+                        b"Page" => {
+                            return Some(kid_id);
                         }
+                        b"Pages" if self.stack.len() < Self::PAGE_TREE_DEPTH_LIMIT => {
+                            let kids = self.kids.unwrap();
+                            if !kids.is_empty() {
+                                self.stack.push(kids);
+                            }
+                            self.kids = Self::kids(self.doc, kid_id);
+                        }
+                        b"Pages" => {}
+                        _ => {}
                     }
                 }
             }
